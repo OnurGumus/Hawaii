@@ -129,9 +129,10 @@ type RequestPart =
         MultiPartFormData(key, Primitive(OpenApiValue.String (value.ToString("O"))))
     static member multipartFormData(key: string, value: byte[]) =
         MultiPartFormData(key, File value)
-    // a structured (object/array) form-data field is sent as its compact JSON text
-    static member multipartFormData(key: string, value: System.Text.Json.Nodes.JsonNode) =
-        MultiPartFormData(key, Primitive(OpenApiValue.String(value.ToJsonString())))
+    // a structured (object/array/record) form-data field is sent as its JSON text;
+    // the concrete overloads above win for scalars, this catches everything else
+    static member multipartFormData<'t>(key: string, value: 't) =
+        MultiPartFormData(key, Primitive(OpenApiValue.String(Serializer.serialize value)))
     static member multipartFormData(key: string, values: string list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String value ]))
     static member multipartFormData(key: string, values: Guid list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String (value.ToString()) ]))
     static member multipartFormData(key: string, values: int list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.Int value ]))
@@ -730,9 +731,10 @@ type RequestPart =
         MultiPartFormData(key, Primitive(OpenApiValue.String (value.ToString("O"))))
     static member multipartFormData(key: string, value: File) =
         MultiPartFormData(key, File value)
-    // a structured (object/array) form-data field is sent as its JSON text
-    static member multipartFormData(key: string, value: obj) =
-        MultiPartFormData(key, Primitive(OpenApiValue.String(JS.JSON.stringify value)))
+    // a structured (object/array/record) form-data field is sent as its JSON text;
+    // the concrete overloads above win for scalars, this catches everything else
+    static member inline multipartFormData<'t>(key: string, value: 't) =
+        MultiPartFormData(key, Primitive(OpenApiValue.String(Serializer.serialize value)))
     static member multipartFormData(key: string, values: string list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String value ]))
     static member multipartFormData(key: string, values: Guid list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String (value.ToString()) ]))
     static member multipartFormData(key: string, values: int list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.Int value ]))

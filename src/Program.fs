@@ -937,7 +937,7 @@ let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (vi
             None
         else
         let isEnum = isEnumType propertyType
-        let required = schema.Required.Contains propertyName
+        let required = schema.Required.Contains propertyName && not (schemaIsNullable propertyType)
         let isObjectArray =
             schemaTypeName propertyType = "array"
             && isNotNull (box propertyType.Items)
@@ -1205,6 +1205,24 @@ let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (vi
         addedFields
         |> Seq.exists (fun (fieldName, _, _) -> fieldName = name)
 
+    /// An F# keyword as a property name otherwise produces an awkward ``backticked``
+    /// record field. For the .NET target, give it a clean field name plus a
+    /// [<JsonPropertyName>] attribute that preserves the original JSON name.
+    let recordFieldName (jsonName: string) : string * SynAttributeList list =
+        let isKeywordLike =
+            not (String.IsNullOrEmpty jsonName)
+            && PrettyNaming.DoesIdentifierNeedBackticks jsonName
+            && jsonName |> Seq.forall (fun character -> Char.IsLetterOrDigit character || character = '_')
+            && not (Char.IsDigit jsonName.[0])
+        if isKeywordLike && config.target = Target.FSharp then
+            let attribute =
+                SynAttributeList.Create [
+                    SynAttribute.Create([ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonPropertyName" ], SynConst.CreateString jsonName)
+                ]
+            jsonName + "_", [ attribute ]
+        else
+            jsonName, []
+
     let rec handleAllOf (currentSchema: IOpenApiSchema) =
         if not (isNull currentSchema.AllOf) then
             for innerSchema in currentSchema.AllOf do
@@ -1215,12 +1233,13 @@ let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (vi
                         | Some fieldType ->
                             let propertyName = property.Key
                             let propertyType = property.Value
-                            let required = schema.Required.Contains propertyName
-                            let field = SynFieldRcd.Create(propertyName, fieldType)
+                            let required = schema.Required.Contains propertyName && not (schemaIsNullable propertyType)
+                            let fsharpFieldName, fieldAttributes = recordFieldName propertyName
+                            let field = SynFieldRcd.Create(fsharpFieldName, fieldType)
                             let docs = xmlDocs propertyType.Description
-                            if not (alreadyContainsProperty propertyName) then
-                                recordFields.Add { field with XmlDoc = docs }
-                                addedFields.Add((propertyName, required, fieldType))
+                            if not (alreadyContainsProperty fsharpFieldName) then
+                                recordFields.Add { field with XmlDoc = docs; Attributes = fieldAttributes }
+                                addedFields.Add((fsharpFieldName, required, fieldType))
 
                 if isNotNull innerSchema.AllOf && innerSchema.AllOf.Count > 0 then
                     // handle recursive allOf references
@@ -1234,12 +1253,13 @@ let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (vi
         | Some fieldType ->
             let propertyName = property.Key
             let propertyType = property.Value
-            let required = schema.Required.Contains propertyName
-            let field = SynFieldRcd.Create(propertyName, fieldType)
+            let required = schema.Required.Contains propertyName && not (schemaIsNullable propertyType)
+            let fsharpFieldName, fieldAttributes = recordFieldName propertyName
+            let field = SynFieldRcd.Create(fsharpFieldName, fieldType)
             let docs = xmlDocs propertyType.Description
-            if not (alreadyContainsProperty propertyName) then
-                recordFields.Add { field with XmlDoc = docs }
-                addedFields.Add((propertyName, required, fieldType))
+            if not (alreadyContainsProperty fsharpFieldName) then
+                recordFields.Add { field with XmlDoc = docs; Attributes = fieldAttributes }
+                addedFields.Add((fsharpFieldName, required, fieldType))
 
     let containsPreservedProperty =
         schema.Properties |> Seq.exists (fun prop -> prop.Key = "additionalProperties")
