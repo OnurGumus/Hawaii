@@ -78,7 +78,12 @@ let rec private readParamType (target: Target) (schema: IOpenApiSchema) : SynTyp
             else sanitizeTypeName schema.Title
         SynType.Create typeName
     | "array" ->
-        readParamType target schema.Items |> SynType.List
+        let itemsSchema = schema.Items
+        if isNull (box itemsSchema) || isEmptySchema itemsSchema then
+            // free-form array items (`items: {}` or no item schema)
+            (if target = Target.FSharp then SynType.JToken() else SynType.Object()) |> SynType.List
+        else
+            readParamType target itemsSchema |> SynType.List
     | "object" ->
         if target = Target.FSharp
         then SynType.JObject()

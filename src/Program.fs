@@ -574,7 +574,13 @@ let rec createFieldType recordName required (propertyName: string) (propertySche
             // base64 encoded characters
             SynType.ByteArray()
         | "array" ->
-            let arrayItemsType = createFieldType recordName required propertyName propertySchema.Items config
+            let itemsSchema = propertySchema.Items
+            let arrayItemsType =
+                if isNull (box itemsSchema) || isEmptySchema itemsSchema then
+                    // free-form array items (`items: {}` or no item schema)
+                    if config.target = Target.FSharp then SynType.JToken() else SynType.Object()
+                else
+                    createFieldType recordName required propertyName itemsSchema config
             SynType.List(arrayItemsType)
         | _ ->
             SynType.String()
@@ -1491,7 +1497,7 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
             else binaryPayloadType config operation
         | "file" ->
             binaryPayloadType config operation
-        | "array" when isNotNull schema.Items ->
+        | "array" when isNotNull schema.Items && not (isEmptySchema schema.Items) ->
             let elementSchema = schema.Items
             let elementType = getFieldType elementSchema status false
             if config.odataSchema && wrapODataResponse
@@ -2958,7 +2964,8 @@ let generateProjectDocument
     (files: XElement seq)
     (copyLocalLockFileAssemblies: bool option)
     (contentItems: XElement seq)
-    (projectReferences: XElement seq) =
+    (projectReferences: XElement seq)
+    (disableImplicitFSharpCore: bool) =
     XDocument(
         XElement.ofStringName("Project",
             XAttribute.ofStringName("Sdk", "Microsoft.NET.Sdk"),
@@ -2967,6 +2974,10 @@ let generateProjectDocument
                 seq {
                     XElement.ofStringName("TargetFramework", "netstandard2.0")
                     XElement.ofStringName("LangVersion", "latest")
+                    // when an explicit FSharp.Core is pinned (Fable target), the
+                    // implicit SDK reference must be turned off to avoid a conflict
+                    if disableImplicitFSharpCore then
+                        XElement.ofStringName("DisableImplicitFSharpCoreReference", "true")
                     if copyLocalLockFileAssemblies.IsSome then
                         XElement.ofStringName("CopyLocalLockFileAssemblies",
                             if copyLocalLockFileAssemblies.Value
@@ -3240,6 +3251,9 @@ let runConfig filePath =
                         if config.asyncReturnType = AsyncReturnType.Task
                         then XElement.PackageReference("Ply", "0.3.1")
                     else
+                        // pinned so Fable's project cracker does not hit an
+                        // FSharp.Core downgrade (NU1605) from Thoth.Json's floor
+                        XElement.PackageReference("FSharp.Core", "10.1.203")
                         XElement.PackageReference("Thoth.Json", "10.5.0")
                         XElement.PackageReference("Fable.SimpleHttp", "3.0.0")
                 ]
@@ -3264,7 +3278,7 @@ let runConfig filePath =
                 let copyLocalLockFileAssemblies = None
                 let contentItems = [ ]
                 let projectReferences = [ ]
-                generateProjectDocument packages files copyLocalLockFileAssemblies contentItems projectReferences
+                generateProjectDocument packages files copyLocalLockFileAssemblies contentItems projectReferences (config.target = Target.Fable)
 
             if config.target = Target.FSharp then
                 let httpLibrary = HttpLibrary.library (config.asyncReturnType = AsyncReturnType.Task) config.project
