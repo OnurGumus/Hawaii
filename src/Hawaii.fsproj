@@ -1,16 +1,24 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>dotnet CLI tool to generate type-safe F# clients from OpenAPI/Swagger services</Description>
+    <Description>Unofficial modernized fork of Hawaii - a dotnet CLI tool that generates type-safe F# and Fable clients from OpenAPI/Swagger/OData. Targets .NET 10, reads OpenAPI 2.0/3.0/3.1/3.2, and generates System.Text.Json (F#) / Thoth.Json (Fable) clients. Not affiliated with the original project.</Description>
     <OutputType>Exe</OutputType>
-    <ToolCommandName>hawaii</ToolCommandName>
+    <ToolCommandName>hawaii-unofficial</ToolCommandName>
     <TargetFramework>net10.0</TargetFramework>
     <PackAsTool>true</PackAsTool>
     <IsPackable>true</IsPackable>
     <RollForward>Major</RollForward>
-    <Version>0.69.0</Version>
-    <PackageReleaseNotes>Fix multi-part form Content-Disposition headers</PackageReleaseNotes>
+    <PackageId>Hawaii.Unofficial</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Zaid Ajaj (original author), Onur Gumus (fork)</Authors>
+    <PackageProjectUrl>https://github.com/OnurGumus/Hawaii</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/OnurGumus/Hawaii</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>fsharp;fable;openapi;swagger;odata;codegen;client</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>Unofficial modernized fork. .NET 10; Microsoft.OpenApi 3.x (reads OpenAPI 2.0/3.0/3.1/3.2, incl. the QUERY method); Fantomas 7; System.Text.Json for the F# target and Thoth.Json for the Fable target; discriminated unions generated from oneOf+discriminator schemas; OPTIONS/TRACE/QUERY HTTP methods; opt-in response headers and streaming responses; TimeSpan support; plus assorted codegen fixes.</PackageReleaseNotes>
   </PropertyGroup>
   <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="\" />
     <Content Include="./storage.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
