@@ -86,6 +86,10 @@ let readConfig file =
             Error "The 'resolveReferences' configuration element must be a boolean"
         elif isNotNull parts.["emptyDefinitions"] && parts.["emptyDefinitions"].ToObject<string>().ToLower().Trim() <> "ignore" && parts.["emptyDefinitions"].ToObject<string>().ToLower().Trim() <> "free-form" then
             Error "The 'emptyDefinitions' configuration element must either be 'ignore' or 'free-form'"
+        elif isNotNull parts.["streamingOperations"] && parts.["streamingOperations"].Type <> JTokenType.Array then
+            Error "The 'streamingOperations' configuration element must be an array of strings"
+        elif isNotNull parts.["responseHeaders"] && parts.["responseHeaders"].Type <> JTokenType.Boolean then
+            Error "The 'responseHeaders' configuration element must be a boolean"
         else
             let configParent = Path.GetDirectoryName file
             Ok {
@@ -124,6 +128,17 @@ let readConfig file =
                                 tag.ToObject<string>() ]
                     else [ ]
                 odataSchema = false
+                streamingOperations =
+                    if isNotNull parts.["streamingOperations"] && parts.["streamingOperations"].Type = JTokenType.Array
+                    then [
+                            for operationId in unbox<JArray> parts.["streamingOperations"] do
+                            if operationId.Type = JTokenType.String then
+                                operationId.ToObject<string>() ]
+                    else [ ]
+                responseHeaders =
+                    if isNotNull parts.["responseHeaders"]
+                    then parts.["responseHeaders"].ToObject<bool>()
+                    else false
             }
     with
     | error ->
@@ -554,6 +569,7 @@ let rec createFieldType recordName required (propertyName: string) (propertySche
         | "string" when propertySchema.Format = "uuid" -> SynType.Guid()
         | "string" when propertySchema.Format = "guid" -> SynType.Guid()
         | "string" when propertySchema.Format = "date-time" -> SynType.DateTimeOffset()
+        | "string" when propertySchema.Format = "time-span" || propertySchema.Format = "date-span" -> SynType.TimeSpan()
         | "string" when propertySchema.Format = "byte" ->
             // base64 encoded characters
             SynType.ByteArray()
@@ -1386,6 +1402,25 @@ let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (vi
         ]
 
 /// <summary>
+/// Returns whether the given operation is opted-in to binary response streaming
+/// (its OperationId is listed in `config.streamingOperations`). Streaming is only
+/// honored by the .NET (`fsharp`) target; the Fable target always ignores it.
+/// </summary>
+let isStreamingOperation (config: CodegenConfig) (operation: OpenApiOperation) =
+    config.target = Target.FSharp
+    && isNotNull operation.OperationId
+    && config.streamingOperations |> List.contains operation.OperationId
+
+/// <summary>
+/// The F# type used to carry a binary response payload: `System.IO.Stream` for
+/// streaming operations on the .NET target, otherwise `byte[]`.
+/// </summary>
+let binaryPayloadType (config: CodegenConfig) (operation: OpenApiOperation) =
+    if isStreamingOperation config operation
+    then SynType.Stream()
+    else SynType.ByteArray()
+
+/// <summary>
 /// Rewrites application/vnd.api+json into application/json to simplify the rest of the codegen pipeline
 /// </summary>
 /// <param name="operation">The operation to rewrite</param>
@@ -1445,13 +1480,17 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
             if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.DateTimeOffset())
             else SynType.DateTimeOffset()
+        | "string" when schema.Format = "time-span" || schema.Format = "date-span" ->
+            if config.odataSchema && wrapODataResponse
+            then SynType.ODataResponse(SynType.TimeSpan())
+            else SynType.TimeSpan()
         | "string" when schema.Format = "byte" ->
             // base64 encoded characters
             if config.odataSchema && wrapODataResponse
-            then SynType.ODataResponse(SynType.ByteArray())
-            else SynType.ByteArray()
+            then SynType.ODataResponse(binaryPayloadType config operation)
+            else binaryPayloadType config operation
         | "file" ->
-            SynType.ByteArray()
+            binaryPayloadType config operation
         | "array" when isNotNull schema.Items ->
             let elementSchema = schema.Items
             let elementType = getFieldType elementSchema status false
@@ -1601,13 +1640,13 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                         let fieldType = SynType.String()
                         [SynFieldRcd.Create("text", fieldType).FromRcd]
                     elif response.Value.Content.ContainsKey "application/octet-stream" || response.Value.Content.ContainsKey "application/pdf" || response.Value.Content.ContainsKey "application/zip" then
-                        let fieldType = SynType.ByteArray()
+                        let fieldType = binaryPayloadType config operation
                         [SynFieldRcd.Create("payload", fieldType).FromRcd]
                     elif response.Value.Content.ContainsKey "image/png" && isNotNull response.Value.Content.["image/png"].Schema && response.Value.Content.["image/png"].Schema.Format = "binary" then
-                        let fieldType = SynType.ByteArray()
+                        let fieldType = binaryPayloadType config operation
                         [SynFieldRcd.Create("payload", fieldType).FromRcd]
                     elif response.Value.Content.ContainsKey "image/png" then
-                        let fieldType = SynType.ByteArray()
+                        let fieldType = binaryPayloadType config operation
                         [SynFieldRcd.Create("payload", fieldType).FromRcd]
                     else
                         []
@@ -1798,14 +1837,26 @@ let createFableThothCoders (openApiDocument: OpenApiDocument) (config: CodegenCo
     // Thoth's `Encode.Auto`/`Decode.Auto` cannot handle int64/uint64/decimal/
     // bigint without explicit extra coders, so register the built-in ones for
     // these primitives - OpenAPI `integer`/`number` fields map onto them.
+    // Thoth.Json has no built-in TimeSpan coder; OpenAPI `time-span`/`date-span`
+    // string fields map onto System.TimeSpan, so register a custom one.
+    line "    let private timeSpanEncoder : Encoder<System.TimeSpan> ="
+    line "        fun value -> Encode.string (value.ToString())"
+    line "    let private timeSpanDecoder : Decoder<System.TimeSpan> ="
+    line "        Decode.string"
+    line "        |> Decode.andThen (fun text ->"
+    line "            match System.TimeSpan.TryParse text with"
+    line "            | true, value -> Decode.succeed value"
+    line "            | _ -> Decode.fail (sprintf \"Invalid TimeSpan '%s'\" text))"
+    line ""
     line "    /// Primitive coders Thoth.Json's Auto cannot synthesise on its own"
-    line "    /// (int64, uint64, decimal, bigint); always part of the extra coders."
+    line "    /// (int64, uint64, decimal, bigint, TimeSpan); always part of the extra coders."
     line "    let private primitiveCoders : ExtraCoders ="
     line "        Extra.empty"
     line "        |> Extra.withInt64"
     line "        |> Extra.withUInt64"
     line "        |> Extra.withDecimal"
     line "        |> Extra.withBigInt"
+    line "        |> Extra.withCustom timeSpanEncoder timeSpanDecoder"
     line ""
 
     if List.isEmpty discriminatorUnions then
@@ -1880,6 +1931,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                         match topLevelObject.Value.Format with
                         | "guid" | "uuid" -> SynType.Guid()
                         | "date-time" -> SynType.DateTimeOffset()
+                        | "time-span" | "date-span" -> SynType.TimeSpan()
                         | "byte" -> SynType.ByteArray()
                         | _ -> SynType.String()
 
@@ -1965,6 +2017,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                             match topLevelObject.Value.Format with
                             | "guid" | "uuid" -> SynType.Guid()
                             | "date-time" -> SynType.DateTimeOffset()
+                            | "time-span" | "date-span" -> SynType.TimeSpan()
                             | "byte" -> SynType.ByteArray()
                             | _ -> SynType.String()
 
@@ -2234,6 +2287,9 @@ let createOpenApiClient
                 ]
 
                 let hasBinaryResponse = containsBinaryResponse operation.Value
+                // streaming is opt-in (config.streamingOperations) and .NET-only;
+                // such operations carry their binary payload as System.IO.Stream
+                let isStreaming = hasBinaryResponse && isStreamingOperation config operation.Value
                 let memberName = deriveMemberName operationInfo.OperationId fullPath operation.Key
 
                 let contentIdent =
@@ -2241,21 +2297,29 @@ let createOpenApiClient
                     then "contentBinary"
                     else "content"
 
+                // The HTTP library always returns the response headers between the
+                // status and the content. When config.responseHeaders is off the
+                // headers slot is bound to a wildcard so they cause no warnings.
+                let headersPat =
+                    if config.responseHeaders
+                    then SynPat.Named(SynIdent(Ident.Create "responseHeaders", None), false, None, range0)
+                    else SynPat.Wild range0
+
                 // for async calls
-                // creates let! (status, content) = {body} in {continuation}
+                // creates let! (status, headers, content) = {body} in {continuation}
                 let deconstructAsyncResponse body continuation =
                     let status = SynPat.Named(SynIdent(Ident.Create "status", None), false, None, range0)
                     let content = SynPat.Named(SynIdent(Ident.Create contentIdent, None), false, None, range0)
-                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], [ range0 ], range0), range0)
+                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; headersPat; content ], [ range0; range0 ], range0), range0)
                     SynExpr.LetOrUseBang(DebugPointAtBinding.Yes range0, false, false, headPat, body, [], continuation, range0, { EqualsRange = Some range0 })
 
                 // for synchronous calls
-                // creates let (status, content) = {body} in {continuation}
+                // creates let (status, headers, content) = {body} in {continuation}
                 let deconstructResponse body continuation =
                     let emptySynValData = SynValData.SynValData(None, SynValInfo.Empty, None)
                     let status = SynPat.Named(SynIdent(Ident.Create "status", None), false, None, range0)
                     let content = SynPat.Named(SynIdent(Ident.Create contentIdent, None), false, None, range0)
-                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], [ range0 ], range0), range0)
+                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; headersPat; content ], [ range0; range0 ], range0), range0)
                     let binding = SynBinding.SynBinding(None, SynBindingKind.Normal, false, false, [], PreXmlDoc.Empty, emptySynValData, headPat, None, body, range0, DebugPointAtBinding.Yes range0, { LeadingKeyword = SynLeadingKeyword.Let range0; InlineKeyword = None; EqualsRange = Some range0 } )
                     SynExpr.LetOrUse(false, false, [binding], continuation, range0, SynExprLetOrUseTrivia.Zero)
 
@@ -2310,7 +2374,9 @@ let createOpenApiClient
                 ]
 
                 let httpFunction =
-                    if hasBinaryResponse
+                    if isStreaming
+                    then $"{operation.Key.ToString().ToLower()}Stream"
+                    elif hasBinaryResponse
                     then $"{operation.Key.ToString().ToLower()}Binary"
                     else operation.Key.ToString().ToLower()
 
@@ -2335,6 +2401,12 @@ let createOpenApiClient
                 ])
 
                 let wrappedReturn expr =
+                    // when response headers are requested, the operation yields a
+                    // tuple of (responseValue, responseHeaders : (string * string) list)
+                    let expr =
+                        if config.responseHeaders
+                        then SynExpr.CreateParen(SynExpr.CreateTuple [ expr; createIdent [ "responseHeaders" ] ])
+                        else expr
                     match config.target with
                     | Target.FSharp when config.synchronous -> expr
                     | _ -> SynExpr.CreateReturn expr

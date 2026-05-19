@@ -225,6 +225,19 @@ module OpenApiHttp =
         httpRequest.Headers.Accept.ParseAdd "application/json"
         httpRequest
 
+    /// Flattens the response headers (and the content headers) of an HTTP
+    /// response into a simple list of key/value string pairs.
+    let extractResponseHeaders (response: HttpResponseMessage) : (string * string) list =
+        [
+            for header in response.Headers do
+                for value in header.Value do
+                    header.Key, value
+            if not (isNull response.Content) then
+                for header in response.Content.Headers do
+                    for value in header.Value do
+                        header.Key, value
+        ]
+
     let applyMultiPartFormData (parts: RequestPart list) (httpRequest: HttpRequestMessage) =
         let formParts =
             parts
@@ -282,7 +295,7 @@ module OpenApiHttp =
         {asyncBuilder} {
             let! response = {getResponse}
             let! content = {getContent}
-            return (response.StatusCode, content)
+            return (response.StatusCode, extractResponseHeaders response, content)
         }
 
     let sendBinaryAsync (httpClient: HttpClient) (method: HttpMethod) (path: string) (parts: RequestPart list) {cancellationArgument} =
@@ -302,7 +315,27 @@ module OpenApiHttp =
         {asyncBuilder} {
             let! response = {getResponse}
             let! content = {getBinaryContent}
-            return (response.StatusCode, content)
+            return (response.StatusCode, extractResponseHeaders response, content)
+        }
+
+    let sendStreamAsync (httpClient: HttpClient) (method: HttpMethod) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        let cancellationToken = Option.defaultValue CancellationToken.None cancellationToken
+        let modifiedPath = applyPathParts path parts
+        let modifiedQueryParams = applyQueryStringParameters modifiedPath parts
+        let requestUri = Uri(httpClient.BaseAddress.OriginalString.TrimEnd '/' + modifiedQueryParams)
+        let request = new HttpRequestMessage(RequestUri=requestUri, Method=method)
+        let populatedRequest =
+            request
+            |> applyJsonContent parts
+            |> applyBinaryContent parts
+            |> applyUrlEncodedFormData parts
+            |> applyMultiPartFormData parts
+            |> applyHeaders parts
+
+        {asyncBuilder} {
+            let! response = {getResponse}
+            let! content = {getStreamContent}
+            return (response.StatusCode, extractResponseHeaders response, content)
         }
 
     let getAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
@@ -319,6 +352,13 @@ module OpenApiHttp =
         getBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
+    let getStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient HttpMethod.Get path parts {cancellationParameter}
+
+    let getStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        getStreamAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
     let postAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendAsync httpClient HttpMethod.Post path parts {cancellationParameter}
 
@@ -329,8 +369,15 @@ module OpenApiHttp =
     let postBinaryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendBinaryAsync httpClient HttpMethod.Post path parts {cancellationParameter}
 
-    let postBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} = 
+    let postBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         postBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let postStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient HttpMethod.Post path parts {cancellationParameter}
+
+    let postStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        postStreamAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
     let deleteAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
@@ -347,6 +394,13 @@ module OpenApiHttp =
         deleteBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
+    let deleteStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient HttpMethod.Delete path parts {cancellationParameter}
+
+    let deleteStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        deleteStreamAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
     let putAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendAsync httpClient HttpMethod.Put path parts {cancellationParameter}
 
@@ -359,6 +413,13 @@ module OpenApiHttp =
 
     let putBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         putBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let putStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient HttpMethod.Put path parts {cancellationParameter}
+
+    let putStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        putStreamAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
     let patchAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
@@ -374,7 +435,14 @@ module OpenApiHttp =
     let patchBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         patchBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
-    
+
+    let patchStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient (HttpMethod "PATCH") path parts {cancellationParameter}
+
+    let patchStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        patchStreamAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
     let headAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendAsync httpClient (HttpMethod "HEAD") path parts {cancellationParameter}
          
@@ -387,6 +455,13 @@ module OpenApiHttp =
 
     let headBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         headBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let headStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient (HttpMethod "HEAD") path parts {cancellationParameter}
+
+    let headStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        headStreamAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
     // OpenAPI 3.2 QUERY method - a safe, idempotent request that carries a body
@@ -404,6 +479,13 @@ module OpenApiHttp =
         queryBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
+    let queryStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient (HttpMethod "QUERY") path parts {cancellationParameter}
+
+    let queryStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        queryStreamAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
     let optionsAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendAsync httpClient (HttpMethod "OPTIONS") path parts {cancellationParameter}
 
@@ -418,6 +500,13 @@ module OpenApiHttp =
         optionsBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
 
+    let optionsStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient (HttpMethod "OPTIONS") path parts {cancellationParameter}
+
+    let optionsStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        optionsStreamAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
     let traceAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         sendAsync httpClient (HttpMethod "TRACE") path parts {cancellationParameter}
 
@@ -430,6 +519,13 @@ module OpenApiHttp =
 
     let traceBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         traceBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let traceStreamAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendStreamAsync httpClient (HttpMethod "TRACE") path parts {cancellationParameter}
+
+    let traceStream (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        traceStreamAsync httpClient path parts {cancellationParameter}
         {convertSync}
 """
 
@@ -449,10 +545,15 @@ let library isTask projectName =
         then "response.Content.ReadAsStringAsync()"
         else "Async.AwaitTask(response.Content.ReadAsStringAsync())"
 
-    let getBinaryContent = 
+    let getBinaryContent =
         if isTask
         then "response.Content.ReadAsByteArrayAsync()"
         else "Async.AwaitTask(response.Content.ReadAsByteArrayAsync())"
+
+    let getStreamContent =
+        if isTask
+        then "response.Content.ReadAsStreamAsync()"
+        else "Async.AwaitTask(response.Content.ReadAsStreamAsync())"
 
     content
         .Replace("{projectName}", projectName)
@@ -464,6 +565,7 @@ let library isTask projectName =
         .Replace("{getResponse}", getResponse)
         .Replace("{getContent}", getContent)
         .Replace("{getBinaryContent}", getBinaryContent)
+        .Replace("{getStreamContent}", getStreamContent)
 
 let fableContent = """namespace {projectName}.Http
 
@@ -859,7 +961,13 @@ module OpenApiHttp =
                 httpRequest
                 |> Http.headers headers
 
-    let sendAsync (method: HttpMethod) (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) : Async<int * string> =
+    /// Flattens the response headers exposed by Fable.SimpleHttp into a simple
+    /// list of key/value string pairs.
+    let extractResponseHeaders (response: HttpResponse) : (string * string) list =
+        response.responseHeaders
+        |> Map.toList
+
+    let sendAsync (method: HttpMethod) (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) : Async<int * (string * string) list * string> =
         async {
             let requestPath = applyPathParts path parts
             let requestPathWithQuery = applyQueryStringParameters requestPath parts
@@ -877,10 +985,10 @@ module OpenApiHttp =
 
             let status = response.statusCode
             let content = response.responseText
-            return status, content
+            return status, extractResponseHeaders response, content
         }
 
-    let sendBinaryAsync (method: HttpMethod) (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) : Async<int * byte[]> =
+    let sendBinaryAsync (method: HttpMethod) (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) : Async<int * (string * string) list * byte[]> =
         async {
             let requestPath = applyPathParts path parts
             let requestPathWithQuery = applyQueryStringParameters requestPath parts
@@ -900,10 +1008,10 @@ module OpenApiHttp =
             | ResponseContent.ArrayBuffer arrayBuffer ->
                 let status = response.statusCode
                 let content = Utilities.createUInt8Array arrayBuffer
-                return status, content
+                return status, extractResponseHeaders response, content
             | _ ->
                 let status = response.statusCode
-                return status, [||]
+                return status, extractResponseHeaders response, [||]
         }
 
     let getAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =

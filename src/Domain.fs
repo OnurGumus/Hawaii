@@ -38,6 +38,13 @@ type CodegenConfig = {
     overrideSchema: JToken option
     filterTags: string list
     odataSchema: bool
+    /// Operation ids whose binary response should be generated as a
+    /// `System.IO.Stream` instead of `byte[]`. Only honored by the .NET
+    /// (`fsharp`) target; ignored by the Fable target. Default: empty.
+    streamingOperations: string list
+    /// When true, every generated operation also returns the HTTP response
+    /// headers as `(string * string) list`. Default: false.
+    responseHeaders: bool
 }
 
 type OperationParameter = {

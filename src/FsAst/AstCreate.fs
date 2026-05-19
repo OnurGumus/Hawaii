@@ -325,6 +325,9 @@ type SynType with
     static member DateTimeOffset() =
         SynType.LongIdent(SynLongIdent.Create [ "System"; "DateTimeOffset" ])
 
+    static member TimeSpan() =
+        SynType.LongIdent(SynLongIdent.Create [ "System"; "TimeSpan" ])
+
     static member DateTime() =
         SynType.LongIdent(SynLongIdent.Create [ "System"; "DateTime" ])
 

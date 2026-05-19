@@ -85,6 +85,7 @@ type SynType with
         )
 
     static member ByteArray() = SynType.Array(1, SynType.Byte(), range0)
+    static member Stream() = SynType.CreateLongIdent "System.IO.Stream"
     static member JToken() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonNode"
     static member JObject() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonObject"
     static member JArray() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonArray"

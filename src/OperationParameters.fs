@@ -60,6 +60,7 @@ let rec private readParamType (target: Target) (schema: IOpenApiSchema) : SynTyp
     | "string" when schema.Format = "uuid" -> SynType.Guid()
     | "string" when schema.Format = "guid" -> SynType.Guid()
     | "string" when schema.Format = "date-time" -> SynType.DateTimeOffset()
+    | "string" when schema.Format = "time-span" || schema.Format = "date-span" -> SynType.TimeSpan()
     | "string" when schema.Format = "binary" ->
         if target = Target.FSharp
         then SynType.ByteArray()
