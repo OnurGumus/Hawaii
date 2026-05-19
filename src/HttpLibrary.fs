@@ -467,7 +467,7 @@ let library isTask projectName =
 let fableContent = """namespace {projectName}.Http
 
 open System
-open Fable.SimpleJson
+open Thoth.Json
 open Fable.SimpleHttp
 open Fable.Core
 open Fable.Core.JsInterop
@@ -614,8 +614,17 @@ type ByteArrayExtensions =
         dataUrl
 
 module Serializer =
-    let inline serialize<'t> (value: 't) = Json.serialize value
-    let inline deserialize<'t> (content: string) = Json.parseNativeAs<'t>(content)
+    /// Thoth.Json `extra` coders, generated alongside the schema types. Holds a
+    /// custom encoder/decoder for every `oneOf` + `discriminator` union so that
+    /// those unions round-trip as the flat OpenAPI discriminator JSON shape.
+    /// When the schema declares no discriminator unions this is `Extra.empty`.
+    let extraCoders = {projectName}.Types.ThothCoders.extraCoders
+    let inline serialize<'t> (value: 't) : string =
+        Encode.Auto.toString<'t>(value, extra = extraCoders)
+    let inline deserialize<'t> (content: string) : 't =
+        match Decode.Auto.fromString<'t>(content, extra = extraCoders) with
+        | Ok value -> value
+        | Error error -> failwithf "Error while deserializing JSON content: %s" error
 
 [<RequireQualifiedAccess>]
 type OpenApiValue =

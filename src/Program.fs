@@ -783,6 +783,28 @@ let createDiscriminatedUnion (unionName: string) (schema: IOpenApiSchema) (targe
 
 
 
+/// In an OpenAPI `oneOf` + `discriminator` schema, each member schema also
+/// declares the discriminator property as one of its own fields. The generated
+/// discriminated union already carries the discriminator (it is written from the
+/// union case), so keeping that field on the member records would emit a
+/// duplicate JSON key. Remove the discriminator property from the member schemas.
+let stripDiscriminatorMemberProperties (document: OpenApiDocument) =
+    if isNotNull (box document) && isNotNull document.Components && isNotNull document.Components.Schemas then
+        let schemas = document.Components.Schemas
+        for schemaEntry in schemas do
+            if isDiscriminatedUnionSchema schemaEntry.Value then
+                let propertyName = schemaEntry.Value.Discriminator.PropertyName
+                for mapping in schemaEntry.Value.Discriminator.Mapping do
+                    let memberId = schemaReferenceId mapping.Value
+                    if isNotNull memberId && schemas.ContainsKey memberId then
+                        match box schemas.[memberId] with
+                        | :? OpenApiSchema as memberSchema ->
+                            if isNotNull memberSchema.Properties then
+                                memberSchema.Properties.Remove propertyName |> ignore
+                            if isNotNull memberSchema.Required then
+                                memberSchema.Required.Remove propertyName |> ignore
+                        | _ -> ()
+
 let statusCode = function
     | "200" -> Some (nameof HttpStatusCode.OK)
     | "201" -> Some (nameof HttpStatusCode.Created)
@@ -1693,9 +1715,122 @@ let includeOperation (operation: OpenApiOperation) (config: CodegenConfig) : boo
             |> List.exists (fun configTag -> tag.Name.StartsWith configTag)
         )
 
+/// Emits an F# double-quoted string literal (with surrounding quotes) for an
+/// arbitrary value, escaping backslashes and quotes so it is safe to splice
+/// into generated source text.
+let escapeFsString (value: string) : string =
+    let escaped =
+        value
+            .Replace("\\", "\\\\")
+            .Replace("\"", "\\\"")
+    "\"" + escaped + "\""
+
+/// For the Fable target, generates raw F# source text holding Thoth.Json
+/// `extra` coders. For every `oneOf` + `discriminator` schema it emits a custom
+/// `Encoder`/`Decoder` pair and registers it in an `extraCoders` value. The
+/// `Serializer` in OpenApiHttp.fs feeds `extraCoders` to `Encode.Auto`/
+/// `Decode.Auto`, so discriminator unions round-trip as the flat OpenAPI
+/// discriminator JSON `{"type":"...", ...fields...}` even when nested.
+/// When the schema declares no discriminator unions, `extraCoders` is just
+/// `Extra.empty`. The result is appended verbatim after the formatted Types.fs.
+let createFableThothCoders (openApiDocument: OpenApiDocument) (config: CodegenConfig) : string =
+    // discriminator union -> (duTypeName, discriminatorPropertyName, (caseName, memberTypeName) list)
+    let discriminatorUnions =
+        if isNull (box openApiDocument.Components) || isNull openApiDocument.Components.Schemas then
+            []
+        else
+            [
+                for topLevelObject in openApiDocument.Components.Schemas do
+                    if isDiscriminatedUnionSchema topLevelObject.Value then
+                        let canUseTitle =
+                            not (invalidTitle topLevelObject.Value.Title)
+                            && not (isGlobalRef topLevelObject.Value.Title openApiDocument)
+                        let typeName =
+                            if canUseTitle
+                            then sanitizeTypeName topLevelObject.Value.Title
+                            else sanitizeTypeName topLevelObject.Key
+                        let propertyName = topLevelObject.Value.Discriminator.PropertyName
+                        let cases =
+                            [
+                                for mapping in topLevelObject.Value.Discriminator.Mapping do
+                                    let memberTypeName = sanitizeTypeName (schemaReferenceId mapping.Value)
+                                    if isNotNull memberTypeName then
+                                        mapping.Key, cleanCaseName mapping.Key, memberTypeName
+                            ]
+                        if not (List.isEmpty cases) then
+                            typeName, propertyName, cases
+            ]
+            |> List.distinctBy (fun (typeName, _, _) -> typeName)
+
+    let builder = StringBuilder()
+    let line (text: string) = builder.AppendLine(text) |> ignore
+    line ""
+    line (sprintf "namespace %s.Types" config.project)
+    line ""
+    line "/// Thoth.Json custom coders for `oneOf` + `discriminator` unions."
+    line "module rec ThothCoders ="
+    line ""
+    line "    open Thoth.Json"
+    line ""
+    line "    #nowarn \"40\""
+    line ""
+
+    // Thoth's `Encode.Auto`/`Decode.Auto` cannot handle int64/uint64/decimal/
+    // bigint without explicit extra coders, so register the built-in ones for
+    // these primitives - OpenAPI `integer`/`number` fields map onto them.
+    line "    /// Primitive coders Thoth.Json's Auto cannot synthesise on its own"
+    line "    /// (int64, uint64, decimal, bigint); always part of the extra coders."
+    line "    let private primitiveCoders : ExtraCoders ="
+    line "        Extra.empty"
+    line "        |> Extra.withInt64"
+    line "        |> Extra.withUInt64"
+    line "        |> Extra.withDecimal"
+    line "        |> Extra.withBigInt"
+    line ""
+
+    if List.isEmpty discriminatorUnions then
+        line "    /// No discriminator unions in this schema; only the primitive coders."
+        line "    let extraCoders : ExtraCoders = primitiveCoders"
+    else
+        for (typeName, propertyName, cases) in discriminatorUnions do
+            let lowerName = camelCase typeName
+            // Encoder: auto-encode the member record; for the Fable target the
+            // member record keeps the discriminator field, so the result is the
+            // flat discriminator object `{"<prop>":"<key>", ...fields...}`.
+            line (sprintf "    let %sEncoder : Encoder<%s> =" lowerName typeName)
+            line "        fun value ->"
+            line "            match value with"
+            for (_, caseName, memberTypeName) in cases do
+                line (sprintf "            | %s.%s payload -> Encode.Auto.generateEncoder<%s>(extra = extraCoders) payload" typeName caseName memberTypeName)
+            line ""
+            // Decoder: read the discriminator field, dispatch each mapping key to
+            // the matching case, auto-decoding the member type.
+            line (sprintf "    let %sDecoder : Decoder<%s> =" lowerName typeName)
+            line (sprintf "        Decode.field \"%s\" Decode.string" propertyName)
+            line "        |> Decode.andThen (fun discriminator ->"
+            line "            match discriminator with"
+            for (mappingKey, caseName, memberTypeName) in cases do
+                line (sprintf "            | %s -> Decode.map %s.%s (Decode.Auto.generateDecoder<%s>(extra = extraCoders))" (escapeFsString mappingKey) typeName caseName memberTypeName)
+            line (sprintf "            | other -> Decode.fail (sprintf \"Unknown discriminator value '%%s' for union %s\" other))" typeName)
+            line ""
+
+        line "    /// All custom discriminator coders, registered for `Encode.Auto`/`Decode.Auto`."
+        line "    let extraCoders : ExtraCoders ="
+        line "        primitiveCoders"
+        for (typeName, _, _) in discriminatorUnions do
+            let lowerName = camelCase typeName
+            line (sprintf "        |> Extra.withCustom %sEncoder %sDecoder" lowerName lowerName)
+
+    builder.ToString()
+
 let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenConfig) =
     let visitedTypes = ResizeArray<string>()
     let moduleTypes = ResizeArray<SynModuleDecl>()
+    // .NET target only: FSharp.SystemTextJson writes the discriminator itself, so
+    // the member records must not also carry it. The Fable/Thoth target keeps the
+    // field - its generated encoder serialises the member record as-is.
+    if config.target = Target.FSharp then
+        stripDiscriminatorMemberProperties openApiDocument
 
     if config.odataSchema then
         if config.target = Target.Fable then
@@ -2039,7 +2174,10 @@ let createOpenApiClient
                 XmlDoc = PreXmlDoc.Empty
                 ValData = synValDataAsConstructor
                 Expr = SynExpr.CreatePartialApp([ clientTypeName ], [ SynExpr.CreateParenedTuple [ createIdent ["url"]; emptyHeadersList ] ])
-                Pattern = SynPatRcd.CreateLongIdent(SynLongIdent.CreateString "new", [
+                // `new` is the secondary-constructor keyword here, not an identifier -
+                // emit it bare (Ident.Create would backtick-escape it as a keyword, which
+                // the F# compiler tolerates but Fable rejects).
+                Pattern = SynPatRcd.CreateLongIdent(mkSynLongIdent [ Ident("new", range0) ], [
                     SynPatRcd.CreateParen(
                         SynPatRcd.Typed {
                             Range = range0
@@ -2991,7 +3129,13 @@ let runConfig filePath =
             else ignore(Directory.CreateDirectory outputDir)
             // generate global schema types
             let visitedTypes, globalTypesModule = createGlobalTypesModule openApiDocument config
-            let code = CodeGen.formatAst (CodeGen.createFile [ globalTypesModule ])
+            let formattedTypes = CodeGen.formatAst (CodeGen.createFile [ globalTypesModule ])
+            // For the Fable target, append Thoth.Json `extra` coders for the
+            // discriminator unions (declared in their own module after the types).
+            let code =
+                if config.target = Target.Fable
+                then formattedTypes + createFableThothCoders openApiDocument config
+                else formattedTypes
             // generate HTTP client wrapper, pass visited types
             let clientModule = createOpenApiClient openApiDocument visitedTypes config
             let clientModuleCode = CodeGen.formatAst (CodeGen.createFile [ clientModule ])
@@ -3004,15 +3148,26 @@ let runConfig filePath =
                         if config.asyncReturnType = AsyncReturnType.Task
                         then XElement.PackageReference("Ply", "0.3.1")
                     else
-                        XElement.PackageReference("Fable.SimpleJson", "3.21.0")
+                        XElement.PackageReference("Thoth.Json", "10.5.0")
                         XElement.PackageReference("Fable.SimpleHttp", "3.0.0")
                 ]
 
-                let files = [
-                    XElement.Compile "OpenApiHttp.fs"
-                    XElement.Compile "Types.fs"
-                    XElement.Compile "Client.fs"
-                ]
+                let files =
+                    if config.target = Target.Fable then
+                        // Fable target: Types.fs holds the Thoth `extra` coders that the
+                        // Serializer (in OpenApiHttp.fs) references, so Types.fs must come
+                        // first. Types.fs is pure types and does not depend on OpenApiHttp.fs.
+                        [
+                            XElement.Compile "Types.fs"
+                            XElement.Compile "OpenApiHttp.fs"
+                            XElement.Compile "Client.fs"
+                        ]
+                    else
+                        [
+                            XElement.Compile "OpenApiHttp.fs"
+                            XElement.Compile "Types.fs"
+                            XElement.Compile "Client.fs"
+                        ]
 
                 let copyLocalLockFileAssemblies = None
                 let contentItems = [ ]
