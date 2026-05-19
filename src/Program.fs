@@ -1,10 +1,12 @@
 ﻿open System
-open Microsoft.OpenApi.Readers
+open Microsoft.OpenApi
+open Microsoft.OpenApi.Reader
 open System.Net.Http
 open FsAst
-open FSharp.Compiler.SyntaxTree
-open FSharp.Compiler.XmlDoc
-open Microsoft.OpenApi.Models
+open Fantomas.FCS.Syntax
+open Fantomas.FCS.SyntaxTrivia
+open Fantomas.FCS.Xml
+open System.Text.Json.Nodes
 open System.IO
 open System.Xml.Linq
 open System.Net
@@ -13,7 +15,7 @@ open Newtonsoft.Json.Linq
 open System.Text
 open Microsoft.OpenApi.OData
 open Microsoft.OData.Edm.Csdl
-open Microsoft.OpenApi.Writers
+open System.Text.Json
 open Newtonsoft.Json
 
 let logo = """
@@ -378,19 +380,16 @@ let findNextEnumTypeName (fieldName: string) objectName (visitedTypes: ResizeArr
     else
         nextTick (capitalize fieldName + "From" + objectName) visitedTypes
 
-let isEnumType (schema: OpenApiSchema) =
-    (schema.Type = "string" || schema.Type = "integer" || String.IsNullOrEmpty schema.Type)
+let isEnumType (schema: IOpenApiSchema) =
+    (let schemaType = schemaTypeName schema in schemaType = "string" || schemaType = "integer" || String.IsNullOrEmpty schemaType)
     && not (isNull schema.Enum)
     && schema.Enum.Count > 0
 
-let (|StringEnum|_|) (schema: OpenApiSchema) =
+let (|StringEnum|_|) (schema: IOpenApiSchema) =
     if isEnumType schema then
         let cases =
             schema.Enum
-            |> Seq.choose (fun enumCase ->
-                match enumCase with
-                | :? Microsoft.OpenApi.Any.OpenApiString as primitiveValue -> Some primitiveValue.Value
-                | _ -> None)
+            |> Seq.choose (fun enumCase -> nodeAsString enumCase)
 
         let containsDigitsOnly (case: string) =
             Seq.forall Char.IsDigit case
@@ -435,12 +434,12 @@ let rec cleanOperationName (operationName: string) =
         |> Array.map capitalize
         |> String.concat ""
 
-let rec deriveOperationName (operationName: string) (path: string) (operationType: OperationType) (visitedTypes: ResizeArray<string>) =
+let rec deriveOperationName (operationName: string) (path: string) (operationType: HttpMethod) (visitedTypes: ResizeArray<string>) =
     if not (String.IsNullOrWhiteSpace operationName) then
         if not (visitedTypes.Contains (cleanOperationName operationName)) then
            cleanOperationName operationName
-        elif not (visitedTypes.Contains (string operationType + cleanOperationName operationName)) then
-            string operationType + cleanOperationName operationName
+        elif not (visitedTypes.Contains (httpMethodName operationType + cleanOperationName operationName)) then
+            httpMethodName operationType + cleanOperationName operationName
         else
             deriveOperationName "" path operationType visitedTypes
     else
@@ -463,11 +462,11 @@ let rec deriveOperationName (operationName: string) (path: string) (operationTyp
             |> String.concat ""
 
         if String.IsNullOrEmpty parameters then
-            cleanOperationName (string operationType + segments)
+            cleanOperationName (httpMethodName operationType + segments)
         else
-            cleanOperationName (string operationType + segments + "By" + parameters)
+            cleanOperationName (httpMethodName operationType + segments + "By" + parameters)
 
-let deriveMemberName (operationName: string) (path: string) (operationType: OperationType) =
+let deriveMemberName (operationName: string) (path: string) (operationType: HttpMethod) =
     if not (String.IsNullOrWhiteSpace operationName) then
         cleanOperationName operationName
     else
@@ -490,9 +489,9 @@ let deriveMemberName (operationName: string) (path: string) (operationType: Oper
             |> String.concat ""
 
         if String.IsNullOrEmpty parameters then
-            cleanOperationName (string operationType + segments)
+            cleanOperationName (httpMethodName operationType + segments)
         else
-            cleanOperationName (string operationType + segments + "By" + parameters)
+            cleanOperationName (httpMethodName operationType + segments + "By" + parameters)
 
 module MediaTypes =
     let [<Literal>] ApplicationJson = "application/json"
@@ -505,27 +504,17 @@ module MediaTypes =
     let [<Literal>] ImageJpeg = "image/jpeg"
     let [<Literal>] ImageGif = "image/gif"
 
-let (|IntEnum|_|) (typeName: string) (schema: OpenApiSchema) =
+let (|IntEnum|_|) (typeName: string) (schema: IOpenApiSchema) =
     if isEnumType schema then
         let cases =
             schema.Enum
-            |> Seq.choose (fun enumCase ->
-                match enumCase with
-                | :? Microsoft.OpenApi.Any.OpenApiInteger as primitiveValue -> Some primitiveValue.Value
-                | _ -> None)
+            |> Seq.choose (fun enumCase -> nodeAsInt enumCase)
 
         let caseNames =
             if not (isNull schema.Extensions) && schema.Extensions.ContainsKey "x-enumNames" then
-                let enumNames = schema.Extensions.["x-enumNames"]
-                match enumNames with
-                | :? Microsoft.OpenApi.Any.OpenApiArray as namesArray ->
-                    namesArray
-                    |> Seq.choose (function
-                        | :? Microsoft.OpenApi.Any.OpenApiString as enumName -> Some enumName.Value
-                        | _ -> None)
-                    |> Seq.toList
-                | _ ->
-                    []
+                match extensionStringArray schema.Extensions.["x-enumNames"] with
+                | Some names -> names
+                | None -> []
             else
                 cases
                 |> Seq.map (fun caseValue -> typeName + string caseValue)
@@ -540,7 +529,7 @@ let (|IntEnum|_|) (typeName: string) (schema: OpenApiSchema) =
     else
         None
 
-let rec createFieldType recordName required (propertyName: string) (propertySchema: OpenApiSchema) (config: CodegenConfig) =
+let rec createFieldType recordName required (propertyName: string) (propertySchema: IOpenApiSchema) (config: CodegenConfig) =
     if not required then
         let optionalType : SynType = createFieldType recordName true propertyName propertySchema config
         SynType.Option(optionalType)
@@ -548,15 +537,15 @@ let rec createFieldType recordName required (propertyName: string) (propertySche
         if config.target = Target.FSharp
         then SynType.JToken()
         else SynType.Object()
-    elif not (isNull propertySchema.Reference) then
+    elif isSchemaReference propertySchema then
         // working with a reference type
         let typeName =
             if invalidTitle propertySchema.Title
-            then sanitizeTypeName propertySchema.Reference.Id
+            then sanitizeTypeName (schemaReferenceId propertySchema)
             else sanitizeTypeName propertySchema.Title
         SynType.Create typeName
     else
-        match propertySchema.Type with
+        match schemaTypeName propertySchema with
         | "integer" when propertySchema.Format = "int64" -> SynType.Int64()
         | "integer" -> SynType.Int()
         | "number" when propertySchema.Format = "float" -> SynType.Float32()
@@ -576,12 +565,46 @@ let rec createFieldType recordName required (propertyName: string) (propertySche
 
 let compiledName (name: string) = SynAttribute.CompiledName name
 
-let createEnumType (enumName: string) (values: seq<string>) (docs: string option) =
+/// Turns an arbitrary string (enum value or discriminator mapping key) into a
+/// valid, capitalized F# union-case identifier.
+let cleanCaseName (case: string) =
+    if String.IsNullOrWhiteSpace case then
+        "EmptyString"
+    else
+        match case.Trim() with
+        | "<" -> "LessThan"
+        | "<=" -> "LessThanOrEqual"
+        | ">" -> "GreaterThan"
+        | ">=" -> "GreaterThanOrEqual"
+        | "=" | "==" -> "Equal"
+        | "!=" | "<>" -> "NotEqual"
+        | "*" -> "Star"
+        | trimmed ->
+            // split into alphanumeric chunks - this drops @, /, -, . and every
+            // other non-identifier character - then capitalize each chunk and join
+            // into a single valid F# identifier (no backticks, no Numeric_ in the
+            // middle - the prefix is only added when the whole name starts with a digit)
+            let separators =
+                trimmed
+                |> Seq.filter (fun character -> not (Char.IsLetterOrDigit character))
+                |> Seq.distinct
+                |> Array.ofSeq
+            let identifier =
+                trimmed.Split(separators, StringSplitOptions.RemoveEmptyEntries)
+                |> Array.map capitalize
+                |> String.concat ""
+            if String.IsNullOrEmpty identifier then "EmptyString"
+            elif Char.IsDigit identifier.[0] then "Numeric_" + identifier
+            else identifier
+
+let createEnumType (enumName: string) (values: seq<string>) (docs: string option) (target: Target) =
     let info : SynComponentInfoRcd = {
         Access = None
         Attributes = [
             SynAttributeList.Create [
-                SynAttribute.Create [ "Fable";"Core"; "StringEnum" ]
+                match target with
+                | Target.Fable -> SynAttribute.Create [ "Fable";"Core"; "StringEnum" ]
+                | Target.FSharp -> ()
                 SynAttribute.RequireQualifiedAccess()
             ]
         ]
@@ -590,52 +613,13 @@ let createEnumType (enumName: string) (values: seq<string>) (docs: string option
             match docs with
             | None -> PreXmlDoc.Empty
             | Some value -> xmlDocs value
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
     }
 
-    let cleanEnumValue (case: string) =
-        if String.IsNullOrWhiteSpace case then
-            "EmptyString"
-        else
-            let parts =
-                case.Split([| '/'; '.'; ','; '['; '-'; ']';'('; ')'; ' ' |], StringSplitOptions.RemoveEmptyEntries)
-            if parts.Length >= 1 then
-                parts
-                |> Array.map (fun part ->
-                    let removedNumberPrefix =
-                        if Char.IsDigit part.[0] && not (Seq.forall Char.IsDigit part) then
-                            part
-                            |> Seq.skipWhile (Char.IsLetter >> not)
-                            |> Array.ofSeq
-                            |> String
-                        elif Seq.forall Char.IsDigit part then
-                            $"Numeric_{part}"
-                        elif part.[0] = '+' then
-                            $"Plus{String(Array.ofSeq part.[1..])}"
-                        elif part = "<" then
-                            "LessThan"
-                        elif part = "<=" then
-                            "LessThanOrEqual"
-                        elif part = ">" then
-                            "GreaterThan"
-                        elif part = ">=" then
-                            "GreaterThanOrEqual"
-                        elif part = "==" || part = "=" then
-                            "Equal"
-                        elif part = "!=" || part = "<>" then
-                            "NotEqual"
-                        elif part = "*" then
-                            "Star"
-                        else
-                            part
-                    capitalize removedNumberPrefix
-                )
-                |> String.concat ""
-            else
-                capitalize case
+    let cleanEnumValue = cleanCaseName
 
     let distinctValues =
         values
@@ -643,9 +627,14 @@ let createEnumType (enumName: string) (values: seq<string>) (docs: string option
 
     let enumRepresentation = SynTypeDefnSimpleReprUnionRcd.Create([
         for value in distinctValues ->
-            let attrs = [ SynAttributeList.Create [| compiledName value  |] ]
+            let caseAttribute =
+                match target with
+                | Target.Fable -> compiledName value
+                | Target.FSharp ->
+                    SynAttribute.Create([ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonName" ], SynConst.CreateString value)
+            let attrs = [ SynAttributeList.Create [| caseAttribute |] ]
             let docs = PreXmlDoc.Empty
-            SynUnionCase.UnionCase(attrs, Ident.Create (cleanEnumValue value), SynUnionCaseType.UnionCaseFields [], docs, None, range0)
+            SynUnionCase.SynUnionCase(attrs, SynIdent(Ident.Create (cleanEnumValue value), None), SynUnionCaseKind.Fields [], docs, None, range0, { BarRange = None })
     ])
 
     let simpleType = SynTypeDefnSimpleReprRcd.Union(enumRepresentation)
@@ -658,20 +647,139 @@ let createEnumType (enumName: string) (values: seq<string>) (docs: string option
 
         let matchClauses = [
             for value in distinctValues ->
-                let id = LongIdentWithDots.CreateString (cleanEnumValue value)
+                let id = SynLongIdent.CreateString (cleanEnumValue value)
                 let matchedValue = SynPat.LongIdent(id, None, None, SynArgPats.Empty, None, range0)
                 let result = SynExpr.CreateConstString value
-                SynMatchClause.Clause(matchedValue, None, result, range0, DebugPointForTarget.No)
+                SynMatchClause.SynMatchClause(matchedValue, None, result, range0, DebugPointAtTarget.No, { ArrowRange = Some range0; BarRange = Some range0 })
         ]
 
         SynMemberDefn.CreateMember
             { SynBindingRcd.Null with
-                Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString "this.Format", [SynPatRcd.Const unitConst])
+                Pattern = SynPatRcd.CreateLongIdent(SynLongIdent.CreateString "this.Format", [SynPatRcd.Const unitConst])
                 Expr = SynExpr.CreateMatch(SynExpr.Ident(Ident.Create "this"), matchClauses)
             }
     ]
 
     SynModuleDecl.CreateSimpleType(info, simpleType, members)
+
+/// True when a schema is semantically a discriminated union: it has a non-empty
+/// `oneOf` and a `discriminator` with a non-empty `mapping`.
+let isDiscriminatedUnionSchema (schema: IOpenApiSchema) : bool =
+    isNotNull (box schema)
+    && isNotNull schema.OneOf
+    && schema.OneOf.Count > 0
+    && isNotNull schema.Discriminator
+    && not (String.IsNullOrWhiteSpace schema.Discriminator.PropertyName)
+    && isNotNull schema.Discriminator.Mapping
+    && schema.Discriminator.Mapping.Count > 0
+
+/// Builds a named-argument expression `propName = valueExpr` as it appears
+/// inside an attribute's argument tuple.
+let private namedAttributeArg (propName: string) (valueExpr: SynExpr) : SynExpr =
+    let equalsIdent =
+        SynExpr.LongIdent(
+            false,
+            SynLongIdent([ Ident.Create "op_Equality" ], [], [ Some (IdentTrivia.OriginalNotation "=") ]),
+            None, range0)
+    let lhs =
+        SynExpr.App(ExprAtomicFlag.NonAtomic, true, equalsIdent, SynExpr.Ident(Ident.Create propName), range0)
+    SynExpr.App(ExprAtomicFlag.NonAtomic, false, lhs, valueExpr, range0)
+
+/// Generates an F# discriminated union from an OpenAPI `oneOf` + `discriminator`
+/// schema. For the .NET target the union is annotated with a
+/// `[<JsonFSharpConverter(...)>]` attribute that makes FSharp.SystemTextJson
+/// serialize it with an internal discriminator tag (a flat JSON object). For the
+/// Fable target the same DU is emitted without that attribute.
+let createDiscriminatedUnion (unionName: string) (schema: IOpenApiSchema) (target: Target) : SynModuleDecl =
+    let discriminator = schema.Discriminator
+    let attributes =
+        [
+            SynAttributeList.Create [
+                match target with
+                | Target.FSharp ->
+                    // [<JsonFSharpConverter(UnionEncoding = (JsonUnionEncoding.InternalTag ||| JsonUnionEncoding.UnwrapRecordCases), UnionTagName = "<prop>", UnionUnwrapSingleFieldCases = true)>]
+                    // InternalTag puts the discriminator inside the object; UnwrapRecordCases
+                    // hoists the case's record fields to the top level so the JSON is a flat
+                    // object (e.g. {"type":"assets","name":...}) instead of a nested/array shape.
+                    let encodingFlag (name: string) =
+                        SynExpr.LongIdent(
+                            false,
+                            SynLongIdent(
+                                [ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonUnionEncoding"; Ident.Create name ],
+                                [ range0; range0; range0; range0; range0 ],
+                                [ None; None; None; None; None; None ]),
+                            None, range0)
+                    let bitwiseOr =
+                        SynExpr.LongIdent(
+                            false,
+                            SynLongIdent([ Ident.Create "op_BitwiseOr" ], [], [ Some (IdentTrivia.OriginalNotation "|||") ]),
+                            None, range0)
+                    let unionEncoding =
+                        // (JsonUnionEncoding.InternalTag ||| JsonUnionEncoding.UnwrapRecordCases)
+                        SynExpr.Paren(
+                            SynExpr.App(
+                                ExprAtomicFlag.NonAtomic, false,
+                                SynExpr.App(ExprAtomicFlag.NonAtomic, true, bitwiseOr, encodingFlag "InternalTag", range0),
+                                encodingFlag "UnwrapRecordCases",
+                                range0),
+                            range0, Some range0, range0)
+                    let argExpr =
+                        SynExpr.Paren(
+                            SynExpr.Tuple(
+                                false,
+                                [
+                                    namedAttributeArg "UnionEncoding" unionEncoding
+                                    namedAttributeArg "UnionTagName" (SynExpr.CreateConstString discriminator.PropertyName)
+                                    namedAttributeArg "UnionUnwrapSingleFieldCases" (SynExpr.Const(SynConst.Bool true, range0))
+                                ],
+                                [ range0; range0 ],
+                                range0),
+                            range0, Some range0, range0)
+                    { SynAttribute.TypeName = mkSynLongIdent [ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonFSharpConverter" ]
+                      SynAttribute.ArgExpr = argExpr
+                      SynAttribute.Target = None
+                      SynAttribute.AppliesToGetterAndSetter = false
+                      SynAttribute.Range = range0 }
+                | Target.Fable -> ()
+                SynAttribute.RequireQualifiedAccess()
+            ]
+        ]
+
+    let info : SynComponentInfoRcd = {
+        Access = None
+        Attributes = attributes
+        Id = [ Ident.Create unionName ]
+        XmlDoc =
+            if String.IsNullOrWhiteSpace schema.Description
+            then PreXmlDoc.Empty
+            else xmlDocs schema.Description
+        Parameters = None
+        Constraints = [ ]
+        PreferPostfix = false
+        Range = range0
+    }
+
+    let cases =
+        [
+            for mapping in discriminator.Mapping do
+                let mappingKey = mapping.Key
+                let mappedTypeName = sanitizeTypeName (schemaReferenceId mapping.Value)
+                if isNotNull mappedTypeName then
+                    let caseName = cleanCaseName mappingKey
+                    // [<JsonName>] comes from FSharp.SystemTextJson, which only the .NET
+                    // target references - the Fable target gets the bare case.
+                    let caseAttrs =
+                        match target with
+                        | Target.FSharp ->
+                            [ SynAttributeList.Create [| SynAttribute.Create([ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonName" ], SynConst.CreateString mappingKey) |] ]
+                        | Target.Fable -> []
+                    let field = SynField.SynField([], false, None, SynType.Create mappedTypeName, false, PreXmlDoc.Empty, None, range0, SynFieldTrivia.Zero)
+                    SynUnionCase.SynUnionCase(caseAttrs, SynIdent(Ident.Create caseName, None), SynUnionCaseKind.Fields [ field ], PreXmlDoc.Empty, None, range0, { BarRange = None })
+        ]
+
+    let unionRepresentation = { Access = None; Cases = cases; Range = range0 }
+    let simpleType = SynTypeDefnSimpleReprRcd.Union(unionRepresentation)
+    SynModuleDecl.CreateSimpleType(info, simpleType, [])
 
 
 
@@ -707,7 +815,7 @@ let createFlagsEnum (enumName: string) (values: seq<string * int>) =
         ]
         Id = [ Ident.Create enumName ]
         XmlDoc = PreXmlDoc.Empty
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -735,7 +843,7 @@ let createTypeAbbreviation (abbreviation: string) (aliasedType: SynType) =
         Attributes = [ ]
         Id = [ Ident.Create (sanitizeTypeName abbreviation) ]
         XmlDoc = PreXmlDoc.Empty
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -743,7 +851,7 @@ let createTypeAbbreviation (abbreviation: string) (aliasedType: SynType) =
 
     let typeAbbrev = SynTypeDefnSimpleRepr.TypeAbbrev(ParserDetail.Ok, aliasedType, range0)
     let typeRepr = SynTypeDefnRepr.Simple(typeAbbrev, range0)
-    let typeInfo = SynTypeDefn.TypeDefn(info.FromRcd, typeRepr, [], range0)
+    let typeInfo = SynTypeDefn.SynTypeDefn(info.FromRcd, typeRepr, [], None, range0, { LeadingKeyword = SynTypeDefnLeadingKeyword.Type range0; EqualsRange = Some range0; WithKeyword = None })
     SynModuleDecl.Types ([ typeInfo ], range0)
 
 /// Creates a declaration: type {typeName} = {aliasedType}
@@ -755,7 +863,7 @@ let createTypeAbbreviationWithDocs (abbreviation: string) (aliasedType: SynType)
         Attributes = [ ]
         Id = [ Ident.Create (sanitizeTypeName abbreviation) ]
         XmlDoc = xmlDocs docs
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -763,7 +871,7 @@ let createTypeAbbreviationWithDocs (abbreviation: string) (aliasedType: SynType)
 
     let typeAbbrev = SynTypeDefnSimpleRepr.TypeAbbrev(ParserDetail.Ok, aliasedType, range0)
     let typeRepr = SynTypeDefnRepr.Simple(typeAbbrev, range0)
-    let typeInfo = SynTypeDefn.TypeDefn(info.FromRcd, typeRepr, [], range0)
+    let typeInfo = SynTypeDefn.SynTypeDefn(info.FromRcd, typeRepr, [], None, range0, { LeadingKeyword = SynTypeDefnLeadingKeyword.Type range0; EqualsRange = Some range0; WithKeyword = None })
     SynModuleDecl.Types ([ typeInfo ], range0)
 
 let isGlobalRef (name: string) (openApiDocument: OpenApiDocument) =
@@ -777,22 +885,22 @@ let isGlobalRef (name: string) (openApiDocument: OpenApiDocument) =
         schemas
         |> List.exists (fun pair ->
             let pairName = sanitizeTypeName pair.Key
-            let isRef = isNotNull pair.Value.Reference
+            let isRef = isSchemaReference pair.Value
             isRef && (
                 typeName = pairName
-                || typeName = sanitizeTypeName pair.Value.Reference.Id
+                || typeName = sanitizeTypeName (schemaReferenceId pair.Value)
             )
         )
 
     isGlobal
 
-let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (visitedTypes: ResizeArray<string>) (config: CodegenConfig) (openApiDocument: OpenApiDocument) (factory: FactoryFunction) : SynModuleDecl list =
+let rec createRecordFromSchema (recordName: string) (schema: IOpenApiSchema) (visitedTypes: ResizeArray<string>) (config: CodegenConfig) (openApiDocument: OpenApiDocument) (factory: FactoryFunction) : SynModuleDecl list =
     let info : SynComponentInfoRcd = {
         Access = None
         Attributes = [ ]
         Id = [ Ident.Create recordName ]
         XmlDoc = xmlDocs schema.Description
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -802,65 +910,65 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
     let recordFields = ResizeArray<SynFieldRcd>()
     let addedFields = ResizeArray<string * bool * SynType>()
 
-    let rec createPropertyType (propertyName: string) (propertyType: OpenApiSchema) =
-        if isNull propertyType then
+    let rec createPropertyType (propertyName: string) (propertyType: IOpenApiSchema) =
+        if isNull (box propertyType) then
             None
         else
         let isEnum = isEnumType propertyType
         let required = schema.Required.Contains propertyName
         let isObjectArray =
-            propertyType.Type = "array"
-            && isNotNull propertyType.Items
-            && propertyType.Items.Type = "object"
-            && isNull propertyType.Items.Reference
+            schemaTypeName propertyType = "array"
+            && isNotNull (box propertyType.Items)
+            && schemaTypeName propertyType.Items = "object"
+            && not (isSchemaReference propertyType.Items)
             && isNotNull propertyType.Items.Properties
             && propertyType.Items.Properties.Count > 0
 
         let isAdditionalProperties =
             propertyType.AdditionalPropertiesAllowed
-            && not (isNull propertyType.AdditionalProperties)
-            && not (isNull propertyType.AdditionalProperties.Type && propertyType.AdditionalProperties.Properties.Count > 0)
+            && not (isNull (box propertyType.AdditionalProperties))
+            && not (isNull (schemaTypeName propertyType.AdditionalProperties) && propertyType.AdditionalProperties.Properties.Count > 0)
 
         let isEnumArray =
-            propertyType.Type = "array"
-            && isNotNull propertyType.Items
+            schemaTypeName propertyType = "array"
+            && isNotNull (box propertyType.Items)
             && isEnumType propertyType.Items
 
         let isEmptyObjectDefinition =
-            propertyType.Type = "object"
+            schemaTypeName propertyType = "object"
             && propertyType.Properties.Count = 0
             && (isNull propertyType.AllOf || propertyType.AllOf.Count = 0)
             && (isNull propertyType.AnyOf || propertyType.AnyOf.Count = 0)
 
-        let isEmptyDefinition = isNull propertyType.Type
+        let isEmptyDefinition = not (schemaTypeFlags propertyType).HasValue
 
         let isKeyValuePairObject =
-            propertyType.Type = "object"
+            schemaTypeName propertyType = "object"
             && propertyType.Title = "KeyValuePair`2"
             && propertyType.Properties.Count = 2
             && propertyType.Properties.ContainsKey "Key"
             && propertyType.Properties.ContainsKey "Value"
 
         let isArrayOfKeyValuePairObject =
-            propertyType.Type = "array"
-            && isNotNull propertyType.Items
-            && propertyType.Items.Type = "object"
+            schemaTypeName propertyType = "array"
+            && isNotNull (box propertyType.Items)
+            && schemaTypeName propertyType.Items = "object"
             && propertyType.Items.Title = "KeyValuePair`2"
             && propertyType.Items.Properties.Count = 2
             && propertyType.Items.Properties.ContainsKey "Key"
             && propertyType.Items.Properties.ContainsKey "Value"
 
         let isArrayOfEmptyObject =
-            propertyType.Type = "array"
-            && isNotNull propertyType.Items
-            && propertyType.Items.Type = "object"
+            schemaTypeName propertyType = "array"
+            && isNotNull (box propertyType.Items)
+            && schemaTypeName propertyType.Items = "object"
             && propertyType.Items.Properties.Count = 0
-            && isNull propertyType.Items.Reference
+            && not (isSchemaReference propertyType.Items)
             && (isNull propertyType.Items.AllOf || propertyType.Items.AllOf.Count = 0)
             && (isNull propertyType.Items.AnyOf || propertyType.Items.AnyOf.Count = 0)
 
         let isPrimitve = List.forall id [
-            (propertyType.Type <> "object" || not (isNull propertyType.Reference))
+            (schemaTypeName propertyType <> "object" || isSchemaReference propertyType)
             not isEnum
             not isObjectArray
             not isEnumArray
@@ -876,7 +984,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             None
         elif isAdditionalProperties then
             let fieldType = createFieldType recordName true propertyName propertyType.AdditionalProperties config
-            match required, propertyType.AdditionalProperties.Nullable with
+            match required, schemaIsNullable propertyType.AdditionalProperties with
             | false, false -> SynType.Option(SynType.Map(SynType.String(), fieldType))
             | true, false -> SynType.Map(SynType.String(), fieldType)
             | false, true -> SynType.Option(SynType.Map(SynType.String(), SynType.Option(fieldType)))
@@ -885,14 +993,14 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         elif isPrimitve then
             let fieldType = createFieldType recordName required propertyName propertyType config
             Some fieldType
-        else if isEnum && isNull propertyType.Reference then
+        else if isEnum && not (isSchemaReference propertyType) then
             // nested enum -> not a reference to a global usable enum
             let enumPropertyName = sanitizeTypeName propertyName
             let enumTypeName = findNextEnumTypeName enumPropertyName recordName visitedTypes
             match propertyType with
             | StringEnum cases ->
                 visitedTypes.Add enumTypeName
-                let createdEnumType = createEnumType enumTypeName cases None
+                let createdEnumType = createEnumType enumTypeName cases None config.target
                 nestedObjects.Add createdEnumType
                 let fieldType =
                     if required
@@ -910,11 +1018,11 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                 Some fieldType
             | _ ->
                 None
-        else if isEnum && not (isNull propertyType.Reference) then
+        else if isEnum && isSchemaReference propertyType then
             // referenced enum
             let typeName =
                 if invalidTitle propertyType.Title
-                then sanitizeTypeName propertyType.Reference.Id
+                then sanitizeTypeName (schemaReferenceId propertyType)
                 else sanitizeTypeName propertyType.Title
             let fieldType =
                 if required
@@ -959,7 +1067,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                 Some fieldType
             | _ ->
                 None
-        else if propertyType.Type = "object" then
+        else if schemaTypeName propertyType = "object" then
             // handle nested objects
             let nestedPropertyNames =
                 propertyType.Properties
@@ -1005,13 +1113,13 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             Some fieldType
         else if isEnumArray then
             let arrayItemsType = propertyType.Items
-            if isNull arrayItemsType.Reference then
+            if not (isSchemaReference arrayItemsType) then
                 // nested enum type -> not a global reference
                 let enumTypeName = findNextEnumTypeName propertyName recordName visitedTypes
                 match arrayItemsType with
                 | StringEnum cases ->
                     visitedTypes.Add enumTypeName
-                    let createdEnumType = createEnumType enumTypeName cases None
+                    let createdEnumType = createEnumType enumTypeName cases None config.target
                     nestedObjects.Add createdEnumType
                     let fieldType =
                         if required
@@ -1033,7 +1141,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                 // referenced enum type
                 let typeName =
                     if invalidTitle arrayItemsType.Title
-                    then sanitizeTypeName arrayItemsType.Reference.Id
+                    then sanitizeTypeName (schemaReferenceId arrayItemsType)
                     else sanitizeTypeName arrayItemsType.Title
 
                 let fieldType =
@@ -1059,12 +1167,12 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                 if required
                 then
                     if config.target = Target.FSharp
-                    then SynType.CreateLongIdent "Newtonsoft.Json.Linq.JArray"
+                    then SynType.CreateLongIdent "System.Text.Json.Nodes.JsonArray"
                     else SynType.ResizeArray(SynType.Create "obj")
 
                 else
                     if config.target = Target.FSharp
-                    then SynType.Option (SynType.CreateLongIdent "Newtonsoft.Json.Linq.JArray")
+                    then SynType.Option (SynType.CreateLongIdent "System.Text.Json.Nodes.JsonArray")
                     else SynType.Option(SynType.ResizeArray(SynType.Create "obj"))
 
             Some fieldType
@@ -1075,10 +1183,10 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         addedFields
         |> Seq.exists (fun (fieldName, _, _) -> fieldName = name)
 
-    let rec handleAllOf (currentSchema: OpenApiSchema) =
+    let rec handleAllOf (currentSchema: IOpenApiSchema) =
         if not (isNull currentSchema.AllOf) then
             for innerSchema in currentSchema.AllOf do
-                if innerSchema.Type = "object" || isNotNull innerSchema.Properties then
+                if schemaTypeName innerSchema = "object" || isNotNull innerSchema.Properties then
                     for property in innerSchema.Properties do
                         match createPropertyType property.Key property.Value with
                         | None -> ()
@@ -1118,7 +1226,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         schema.AdditionalPropertiesAllowed
         && not (isNull schema.AdditionalProperties)
         && not containsPreservedProperty
-        && not (isNull schema.AdditionalProperties.Type && schema.Properties.Count > 0)
+        && not (not (schemaTypeFlags schema.AdditionalProperties).HasValue && schema.Properties.Count > 0)
 
     if includeAdditionalProperties then
         // when there are additional properties
@@ -1126,7 +1234,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
         // then ignore the fixed properties and only get the dictionary type
         // when only additional properties are present
         // then create type abbreviation
-        let isFreeForm = isNull schema.AdditionalProperties.Type
+        let isFreeForm = not (schemaTypeFlags schema.AdditionalProperties).HasValue
         match createPropertyType "additionalProperties" schema.AdditionalProperties with
         | None -> [ ]
         | Some additionalType ->
@@ -1153,8 +1261,8 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
             let fieldType = SynType.Option(SynType.String())
             let recordField = SynFieldRcd.Create(odataTypeNameField, fieldType)
             let attributes = SynAttributeList.Create [
-                // create [<JsonProperty "@odata.type">]
-                SynAttribute.Create([ Ident.Create "Newtonsoft"; Ident.Create "Json"; Ident.Create "JsonProperty" ], SynConst.CreateString "@odata.type")
+                // create [<System.Text.Json.Serialization.JsonPropertyName "@odata.type">]
+                SynAttribute.Create([ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonPropertyName" ], SynConst.CreateString "@odata.type")
             ]
             recordFields.Insert(0, { recordField with Attributes = [ attributes ] })
             addedFields.Insert(0, (odataTypeNameField, required, fieldType))
@@ -1180,7 +1288,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                                 Type = SynType.Create recordName
                                 Range = range0
                                 Pattern =
-                                    SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString "Create", [
+                                    SynPatRcd.CreateLongIdent(SynLongIdent.CreateString "Create", [
                                         SynPatRcd.CreateParen(
                                             SynPatRcd.Tuple {
                                                 Patterns = [
@@ -1192,7 +1300,7 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                                                         else
                                                             if required then yield SynPatRcd.Typed {
                                                                 Type = fieldType
-                                                                Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString (camelCase fieldName), [])
+                                                                Pattern = SynPatRcd.CreateLongIdent(SynLongIdent.CreateString (camelCase fieldName), [])
                                                                 Range = range0
                                                             }
                                                 ]
@@ -1207,13 +1315,13 @@ let rec createRecordFromSchema (recordName: string) (schema: OpenApiSchema) (vis
                             for (fieldName, required, fieldType) in addedFields do
                                 let expr =
                                     if fieldName = "additionalProperties" && not containsPreservedProperty
-                                    then Some(SynExpr.CreateLongIdent(LongIdentWithDots.CreateString "Map.empty"))
+                                    then Some(SynExpr.CreateLongIdent(SynLongIdent.CreateString "Map.empty"))
                                     elif fieldName = "@odata.type" || (fieldName = "ODataTypeName" && config.odataSchema)
                                     then Some(SynExpr.CreatePartialApp([ "Some" ], [ SynExpr.CreateConstString $"#{schema.Title}" ]))
                                     elif required
                                     then Some(SynExpr.Ident(Ident.Create (camelCase fieldName)))
                                     else Some(SynExpr.Ident(Ident.Create "None"))
-                                ((LongIdentWithDots.CreateFromLongIdent([ Ident.Create fieldName ]), false), expr)
+                                ((SynLongIdent.CreateFromLongIdent([ Ident.Create fieldName ]), false), expr)
                         ]
                 }
         ]
@@ -1252,16 +1360,16 @@ let rewriteOperationVendorJson  (operation: OpenApiOperation) =
             operation.RequestBody.Content.Remove "application/vnd.api+json" |> ignore
             operation.RequestBody.Content.Add("application/json", mediaType)
 
-let createResponseType (operation: OpenApiOperation) (path: string) (operationType: OperationType) (visitedTypes: ResizeArray<string>) (config: CodegenConfig) (document: OpenApiDocument) =
+let createResponseType (operation: OpenApiOperation) (path: string) (operationType: HttpMethod) (visitedTypes: ResizeArray<string>) (config: CodegenConfig) (document: OpenApiDocument) =
     // rewrite application/vnd.api+json into application/json
     rewriteOperationVendorJson operation
     let intermediateTypes = ResizeArray<SynModuleDecl>()
     let operationName = deriveOperationName (capitalize operation.OperationId) path operationType visitedTypes
     visitedTypes.Add operationName
     // hack: add it to the operation and retrieve it later
-    operation.Extensions.Add("ResponseTypeName", new Microsoft.OpenApi.Any.OpenApiString(operationName))
-    let rec getFieldType (schema: OpenApiSchema) (status: string) (wrapODataResponse: bool) =
-        match schema.Type with
+    operation.Extensions.Add("ResponseTypeName", stringExtension operationName)
+    let rec getFieldType (schema: IOpenApiSchema) (status: string) (wrapODataResponse: bool) =
+        match schemaTypeName schema with
         | "integer" when schema.Format = "int64" ->
             if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(SynType.Int64())
@@ -1312,18 +1420,19 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
             // element type schema is null
             let elementType =
                 if config.target = Target.FSharp
-                then SynType.CreateLongIdent "Newtonsoft.Json.Linq.JArray"
+                then SynType.CreateLongIdent "System.Text.Json.Nodes.JsonArray"
                 else SynType.ResizeArray(SynType.Create "obj")
 
             if config.odataSchema && wrapODataResponse
             then SynType.ODataResponse(elementType)
             else elementType
 
-        | _ when not (isNull schema.Reference) ->
-            // working with a reference type
+        | _ when isSchemaReference schema ->
+            // working with a reference type (the type match above lets a $ref
+            // to a primitive resolve to that primitive, as in Hawaii's 1.x model)
             let typeName =
                 if invalidTitle schema.Title
-                then sanitizeTypeName schema.Reference.Id
+                then sanitizeTypeName (schemaReferenceId schema)
                 else sanitizeTypeName schema.Title
             SynType.Create typeName
         | _ when schema.AdditionalPropertiesAllowed && not (isNull schema.AdditionalProperties) ->
@@ -1346,8 +1455,8 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
         isNotNull operation.RequestBody
         && operation.RequestBody.Content.ContainsKey MediaTypes.ApplicationJson
         && isNotNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema
-        && operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Type = "object"
-        && isNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Reference
+        && schemaTypeName operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema = "object"
+        && not (isSchemaReference operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema)
         && isNotNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Properties
         && operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Properties.Count > 0
 
@@ -1358,16 +1467,16 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
         let factory = FactoryFunction.Create
         for generatedType in createRecordFromSchema payloadTypeName schema visitedTypes config document factory do
             intermediateTypes.Add generatedType
-        operation.Extensions.Add("RequestTypePayload", new Microsoft.OpenApi.Any.OpenApiString(payloadTypeName))
+        operation.Extensions.Add("RequestTypePayload", stringExtension payloadTypeName)
 
     let hasArrayOfLooseObjectsInRequestPayload =
         isNotNull operation.RequestBody
         && operation.RequestBody.Content.ContainsKey MediaTypes.ApplicationJson
         && isNotNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema
-        && operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Type = "array"
-        && isNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Reference
+        && schemaTypeName operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema = "array"
+        && not (isSchemaReference operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema)
         && isNotNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Items
-        && operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Items.Type = "object"
+        && schemaTypeName operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Items = "object"
         && isNotNull operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Items.Properties
         && operation.RequestBody.Content.[MediaTypes.ApplicationJson].Schema.Items.Properties.Count > 0
 
@@ -1381,7 +1490,7 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
         for generatedType in createRecordFromSchema elementTypeName schema visitedTypes config document factory do
             intermediateTypes.Add generatedType
         intermediateTypes.Add(createTypeAbbreviation payloadTypeName (SynType.List(SynType.Create elementTypeName)))
-        operation.Extensions.Add("RequestTypePayload", new Microsoft.OpenApi.Any.OpenApiString(payloadTypeName))
+        operation.Extensions.Add("RequestTypePayload", stringExtension payloadTypeName)
 
     let info : SynComponentInfoRcd = {
         Access = None
@@ -1392,7 +1501,7 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
         ]
         Id = [ Ident.Create operationName ]
         XmlDoc = PreXmlDoc.Empty
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -1421,14 +1530,14 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                                 let keyType = SynType.String()
                                 let fieldType =  SynType.Map(keyType, valueType)
                                 [SynFieldRcd.Create("payload", fieldType).FromRcd]
-                            elif isNotNull responsePayloadType.Schema.Reference then
+                            elif isSchemaReference responsePayloadType.Schema then
                                 // reference to an empty schema
                                 if config.emptyDefinitions = EmptyDefinitionResolution.GenerateFreeForm then
                                     let fieldType = getFieldType responsePayloadType.Schema caseName true
                                     [SynFieldRcd.Create("payload", fieldType).FromRcd]
                                 else
                                     []
-                            elif responsePayloadType.Schema.Type = "object" then
+                            elif schemaTypeName responsePayloadType.Schema = "object" then
                                 if config.target = Target.FSharp then
                                     let fieldType = SynType.JToken()
                                     [SynFieldRcd.Create("payload", fieldType).FromRcd]
@@ -1461,13 +1570,13 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
                     else
                         []
                 let docs = xmlDocs response.Value.Description
-                yield SynUnionCase.UnionCase([], Ident.Create (capitalize caseName), SynUnionCaseType.UnionCaseFields fieldTypes, docs, None, range0)
+                yield SynUnionCase.SynUnionCase([], SynIdent(Ident.Create (capitalize caseName), None), SynUnionCaseKind.Fields fieldTypes, docs, None, range0, { BarRange = None })
             | None ->
                 ()
 
         if not containsOkOrDefault then
             let docs = PreXmlDoc.Empty
-            yield SynUnionCase.UnionCase([], Ident.Create (capitalize "DefaultResponse"), SynUnionCaseType.UnionCaseFields [], docs, None, range0)
+            yield SynUnionCase.SynUnionCase([], SynIdent(Ident.Create (capitalize "DefaultResponse"), None), SynUnionCaseKind.Fields [], docs, None, range0, { BarRange = None })
     ])
 
 
@@ -1480,18 +1589,18 @@ let createResponseType (operation: OpenApiOperation) (path: string) (operationTy
 
 // type KeyValuePair<'TKey, 'TValue> = { Key: 'TKey, Value: 'TValue }
 let createKeyValuePair() =
-    let keyTypeArg = SynTypar.Typar(Ident.Create "TKey", TyparStaticReq.NoStaticReq, false)
-    let valueTypeArg = SynTypar.Typar(Ident.Create "TValue", TyparStaticReq.NoStaticReq, false)
+    let keyTypeArg = SynTypar.SynTypar(Ident.Create "TKey", TyparStaticReq.None, false)
+    let valueTypeArg = SynTypar.SynTypar(Ident.Create "TValue", TyparStaticReq.None, false)
 
     let info : SynComponentInfoRcd = {
         Access = None
         Attributes = [ ]
         Id = [ Ident.Create "KeyValuePair" ]
         XmlDoc = PreXmlDoc.Empty
-        Parameters = [
-            SynTyparDecl.TyparDecl([], keyTypeArg)
-            SynTyparDecl.TyparDecl([], valueTypeArg)
-        ]
+        Parameters = Some (SynTyparDecls.PostfixList([
+            SynTyparDecl.SynTyparDecl([], keyTypeArg, [], { AmpersandRanges = [] })
+            SynTyparDecl.SynTyparDecl([], valueTypeArg, [], { AmpersandRanges = [] })
+        ], [], range0))
         Constraints = [ ]
         PreferPostfix = true
         Range = range0
@@ -1508,22 +1617,22 @@ let createKeyValuePair() =
 
 // type ODataResponse<'TValue> = { value: 'TValue }
 let createODataResponse(config: CodegenConfig) =
-    let valueTypeArg = SynTypar.Typar(Ident.Create "TValue", TyparStaticReq.NoStaticReq, false)
+    let valueTypeArg = SynTypar.SynTypar(Ident.Create "TValue", TyparStaticReq.None, false)
 
     let info : SynComponentInfoRcd = {
         Access = None
         Attributes = [ ]
         Id = [ Ident.Create "ODataResponse" ]
         XmlDoc = PreXmlDoc.Empty
-        Parameters = [ SynTyparDecl.TyparDecl([], valueTypeArg) ]
+        Parameters = Some (SynTyparDecls.PostfixList([ SynTyparDecl.SynTyparDecl([], valueTypeArg, [], { AmpersandRanges = [] }) ], [], range0))
         Constraints = [ ]
         PreferPostfix = true
         Range = range0
     }
 
     let attributes = SynAttributeList.Create [
-        // [<JsonProperty "@odata.context">]
-        SynAttribute.Create([ Ident.Create "Newtonsoft"; Ident.Create "Json"; Ident.Create "JsonProperty" ], SynConst.CreateString "@odata.context")
+        // [<System.Text.Json.Serialization.JsonPropertyName "@odata.context">]
+        SynAttribute.Create([ Ident.Create "System"; Ident.Create "Text"; Ident.Create "Json"; Ident.Create "Serialization"; Ident.Create "JsonPropertyName" ], SynConst.CreateString "@odata.context")
     ]
 
     let odataContextField = SynFieldRcd.Create("ODataContext", SynType.Option(SynType.String()))
@@ -1539,15 +1648,15 @@ let createODataResponse(config: CodegenConfig) =
     SynModuleDecl.CreateSimpleType(info, simpleRecordType)
 
 
-let rec isPrimitiveAllOf (schema: OpenApiSchema) =
+let rec isPrimitiveAllOf (schema: IOpenApiSchema) =
     if isNotNull schema.AllOf && schema.AllOf.Count > 0 then
         schema.AllOf
         |> Seq.forall(fun innerSchema ->
             let isPrimitive =
-                innerSchema.Type = "string"
-                || innerSchema.Type = "boolean"
-                || innerSchema.Type = "integer"
-                || innerSchema.Type = "number"
+                schemaTypeName innerSchema = "string"
+                || schemaTypeName innerSchema = "boolean"
+                || schemaTypeName innerSchema = "integer"
+                || schemaTypeName innerSchema = "number"
 
             if isNotNull innerSchema.AllOf && innerSchema.AllOf.Count > 0 then
                 isPrimitive && isPrimitiveAllOf innerSchema
@@ -1557,11 +1666,11 @@ let rec isPrimitiveAllOf (schema: OpenApiSchema) =
     else
         false
 
-let rec collectPrimitiveAllOf (schema: OpenApiSchema) =
+let rec collectPrimitiveAllOf (schema: IOpenApiSchema) =
     if isNotNull schema.AllOf then
         [
             for innerSchema in schema.AllOf do
-                yield innerSchema.Type
+                yield schemaTypeName innerSchema
 
                 if isNotNull innerSchema.AllOf then
                     for nestedSchema in innerSchema.AllOf do
@@ -1604,11 +1713,11 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                 then sanitizeTypeName topLevelObject.Key
                 else sanitizeTypeName topLevelObject.Value.Title
 
-            if topLevelObject.Value.Type = "string" then
+            if schemaTypeName topLevelObject.Value = "string" then
                 match topLevelObject.Value with
                 | StringEnum cases ->
                     // create global enum type
-                    moduleTypes.Add (createEnumType typeName cases (Some topLevelObject.Value.Description))
+                    moduleTypes.Add (createEnumType typeName cases (Some topLevelObject.Value.Description) config.target)
                     visitedTypes.Add typeName
                 | _ ->
                     // create abbreviated type
@@ -1621,7 +1730,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
 
                     moduleTypes.Add (createTypeAbbreviationWithDocs typeName abbreviatedType topLevelObject.Value.Description)
                     visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "integer" then
+            elif schemaTypeName topLevelObject.Value = "integer" then
                 match topLevelObject.Value with
                 | IntEnum typeName cases ->
                     // create global enum type
@@ -1635,7 +1744,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                         | _ -> SynType.Int()
                     moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
                     visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "number" then
+            elif schemaTypeName topLevelObject.Value = "number" then
                 // create type abbreviation
                 let abbreviatedType =
                     match topLevelObject.Value.Format with
@@ -1643,7 +1752,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                     | _ -> SynType.Double()
                 moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
                 visitedTypes.Add typeName
-            elif topLevelObject.Value.Type = "boolean" then
+            elif schemaTypeName topLevelObject.Value = "boolean" then
                 // create type abbreviation
                 moduleTypes.Add (createTypeAbbreviation typeName (SynType.Bool()))
                 visitedTypes.Add typeName
@@ -1671,7 +1780,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                     visitedTypes.Add typeName
                 | _ ->
                     ()
-            elif topLevelObject.Value.Type = "array" then
+            elif schemaTypeName topLevelObject.Value = "array" then
                 let elementType = topLevelObject.Value.Items
                 if isNull elementType then
                     if config.target = Target.FSharp then
@@ -1680,16 +1789,16 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                     else
                         moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Object())))
                         visitedTypes.Add typeName
-                elif isNotNull elementType.Reference && isNotNull elementType.Reference.Id then
-                    let referencedType = elementType.Reference.Id
+                elif isSchemaReference elementType then
+                    let referencedType = schemaReferenceId elementType
                     moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Create referencedType)))
                     visitedTypes.Add typeName
-                elif elementType.Type = "string" then
+                elif schemaTypeName elementType = "string" then
                     match elementType with
                     | StringEnum cases ->
                         // create global enum type
                         let enumTypeName = $"EnumFor{typeName}";
-                        moduleTypes.Add (createEnumType enumTypeName cases None)
+                        moduleTypes.Add (createEnumType enumTypeName cases None config.target)
                         let arrayOfEnum = SynType.List(SynType.Create enumTypeName)
                         moduleTypes.Add (createTypeAbbreviation typeName arrayOfEnum)
 
@@ -1708,7 +1817,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
 
                         moduleTypes.Add (createTypeAbbreviationWithDocs typeName listOfAbbrev topLevelObject.Value.Description)
                         visitedTypes.Add typeName
-                elif elementType.Type = "integer" then
+                elif schemaTypeName elementType = "integer" then
                     match elementType with
                     | IntEnum typeName cases ->
                         // create global enum type
@@ -1725,7 +1834,7 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                             | _ -> SynType.List(SynType.Int())
                         moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
                         visitedTypes.Add typeName
-                elif elementType.Type = "number" then
+                elif schemaTypeName elementType = "number" then
                     // create type abbreviation
                     let abbreviatedType =
                         match elementType.Format with
@@ -1733,11 +1842,11 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                         | _ -> SynType.List(SynType.Double())
                     moduleTypes.Add (createTypeAbbreviation typeName abbreviatedType)
                     visitedTypes.Add typeName
-                elif elementType.Type = "boolean" then
+                elif schemaTypeName elementType = "boolean" then
                     // create type abbreviation
                     moduleTypes.Add (createTypeAbbreviation typeName (SynType.List(SynType.Bool())))
                     visitedTypes.Add typeName
-                elif elementType.Type = "object" && not (visitedTypes.Contains $"{typeName}ArrayItem") then
+                elif schemaTypeName elementType = "object" && not (visitedTypes.Contains $"{typeName}ArrayItem") then
                     let elementTypeName = $"{typeName}ArrayItem"
                     visitedTypes.Add typeName
                     visitedTypes.Add elementTypeName
@@ -1761,15 +1870,17 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
                 else sanitizeTypeName topLevelObject.Key
 
             if config.odataSchema then
-                topLevelObject.Value.Title <- topLevelObject.Key
+                match box topLevelObject.Value with
+                | :? OpenApiSchema as concreteSchema -> concreteSchema.Title <- topLevelObject.Key
+                | _ -> ()
 
             let isAllOf =
-                isNull topLevelObject.Value.Type
+                not (schemaTypeFlags topLevelObject.Value).HasValue
                 && not (isNull topLevelObject.Value.AllOf)
                 && topLevelObject.Value.AllOf.Count > 0
 
             let isKeyValuePairObject =
-                topLevelObject.Value.Type = "object"
+                schemaTypeName topLevelObject.Value = "object"
                 && topLevelObject.Value.Title = "KeyValuePair`2"
                 && topLevelObject.Value.Properties.Count = 2
                 && topLevelObject.Value.Properties.ContainsKey "Key"
@@ -1796,7 +1907,12 @@ let createGlobalTypesModule (openApiDocument: OpenApiDocument) (config: CodegenC
             elif isKeyValuePairObject then
                 // skip generating more key value pair type
                 ()
-            elif topLevelObject.Value.Type = "object" || isAllOf || (isNull topLevelObject.Value.Type && topLevelObject.Value.Properties.Count > 0) then
+            elif isDiscriminatedUnionSchema topLevelObject.Value then
+                // a `oneOf` + `discriminator` (with mapping) schema is a discriminated union
+                if not (visitedTypes.Contains typeName) then
+                    visitedTypes.Add typeName
+                    moduleTypes.Add (createDiscriminatedUnion typeName topLevelObject.Value config.target)
+            elif schemaTypeName topLevelObject.Value = "object" || isAllOf || (not (schemaTypeFlags topLevelObject.Value).HasValue && topLevelObject.Value.Properties.Count > 0) then
                 if not (visitedTypes.Contains typeName) then
                     visitedTypes.Add typeName
                     let factory = FactoryFunction.Create
@@ -1830,17 +1946,17 @@ let paramReplace (parameter: string) (sep: char) =
     |> String.concat ""
     |> camelCase
 
-let responseContainsBinaryOutput (response: OpenApiResponse) =
+let responseContainsBinaryOutput (response: IOpenApiResponse) =
     if response.Content.ContainsKey MediaTypes.ApplicationJson then
         let jsonResponse = response.Content.[MediaTypes.ApplicationJson]
         let hasStringByteOutput =
             isNotNull jsonResponse.Schema
-            && jsonResponse.Schema.Type = "string"
+            && schemaTypeName jsonResponse.Schema = "string"
             && jsonResponse.Schema.Format = "byte"
 
         let hasFileOutput =
             isNotNull jsonResponse.Schema
-            && jsonResponse.Schema.Type = "file"
+            && schemaTypeName jsonResponse.Schema = "file"
 
         let hasBinaryOutput = hasStringByteOutput || hasFileOutput
         hasBinaryOutput
@@ -1861,18 +1977,18 @@ let containsBinaryResponse (operation: OpenApiOperation) =
     operation.Responses
     |> Seq.exists (fun pair -> responseContainsBinaryOutput pair.Value)
 
-let createIdent xs = SynExpr.CreateLongIdent(LongIdentWithDots.Create xs)
+let createIdent xs = SynExpr.CreateLongIdent(SynLongIdent.Create xs)
 let stringExpr value = SynExpr.CreateConstString value
 let createLetAssignment leftSide rightSide continuation =
     let emptySynValData = SynValData.SynValData(None, SynValInfo.Empty, None)
-    let headPat = SynPat.Named(SynPat.Wild range0, leftSide, false, None, range0)
-    let binding = SynBinding.Binding(None, SynBindingKind.NormalBinding, false, false, [], PreXmlDoc.Empty, emptySynValData, headPat, None, rightSide, range0, DebugPointForBinding.DebugPointAtBinding range0 )
-    SynExpr.LetOrUse(false, false, [binding], continuation, range0)
+    let headPat = SynPat.Named(SynIdent(leftSide, None), false, None, range0)
+    let binding = SynBinding.SynBinding(None, SynBindingKind.Normal, false, false, [], PreXmlDoc.Empty, emptySynValData, headPat, None, rightSide, range0, DebugPointAtBinding.Yes range0, { LeadingKeyword = SynLeadingKeyword.Let range0; InlineKeyword = None; EqualsRange = Some range0 } )
+    SynExpr.LetOrUse(false, false, [binding], continuation, range0, SynExprLetOrUseTrivia.Zero)
 
 let createLetBangAssignment leftSide body continuation =
     let emptySynValData = SynValData.SynValData(None, SynValInfo.Empty, None)
-    let headPat = SynPat.Named(SynPat.Wild range0, leftSide, false, None, range0)
-    SynExpr.LetOrUseBang(DebugPointForBinding.DebugPointAtBinding range0, false, false, headPat, body, [], continuation, range0)
+    let headPat = SynPat.Named(SynIdent(leftSide, None), false, None, range0)
+    SynExpr.LetOrUseBang(DebugPointAtBinding.Yes range0, false, false, headPat, body, [], continuation, range0, { EqualsRange = Some range0 })
 
 let createOpenApiClient
     (openApiDocument: OpenApiDocument)
@@ -1887,7 +2003,7 @@ let createOpenApiClient
         Attributes = [ ]
         Id = [ Ident.Create clientTypeName ]
         XmlDoc = xmlDocs openApiDocument.Info.Description
-        Parameters = [ ]
+        Parameters = None
         Constraints = [ ]
         PreferPostfix = false
         Range = range0
@@ -1911,7 +2027,7 @@ let createOpenApiClient
         let synValDataAsConstructor =
             match SynBindingRcd.Null.ValData with
             | SynValData(Some memberFlags, synValInfo, ident) ->
-                let modifiedFlags = { memberFlags with MemberKind = MemberKind.Constructor }
+                let modifiedFlags = { memberFlags with MemberKind = SynMemberKind.Constructor }
                 SynValData(Some modifiedFlags, synValInfo, ident)
             | _ ->
                 SynBindingRcd.Null.ValData
@@ -1923,12 +2039,12 @@ let createOpenApiClient
                 XmlDoc = PreXmlDoc.Empty
                 ValData = synValDataAsConstructor
                 Expr = SynExpr.CreatePartialApp([ clientTypeName ], [ SynExpr.CreateParenedTuple [ createIdent ["url"]; emptyHeadersList ] ])
-                Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString "new", [
+                Pattern = SynPatRcd.CreateLongIdent(SynLongIdent.CreateString "new", [
                     SynPatRcd.CreateParen(
                         SynPatRcd.Typed {
                             Range = range0
                             Type = SynType.String()
-                            Pattern = SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString("url"), [])
+                            Pattern = SynPatRcd.CreateLongIdent(SynLongIdent.CreateString("url"), [])
                         })
                 ])
         }
@@ -1946,7 +2062,7 @@ let createOpenApiClient
                     operationInfo.Parameters.Add(OpenApiParameter(
                         Name = "cancellationToken",
                         In = ParameterLocation.Query,
-                        Schema = OpenApiSchema(Reference = OpenApiReference(Id = "CancellationToken"))))
+                        Schema = OpenApiSchemaReference("CancellationToken", openApiDocument, null)))
 
                 let parameters = operationParameters operationInfo pathInfo.Parameters config
 
@@ -1970,20 +2086,20 @@ let createOpenApiClient
                 // for async calls
                 // creates let! (status, content) = {body} in {continuation}
                 let deconstructAsyncResponse body continuation =
-                    let status = SynPat.Named(SynPat.Wild range0, Ident.Create "status", false, None, range0)
-                    let content = SynPat.Named(SynPat.Wild range0, Ident.Create contentIdent, false, None, range0)
-                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], range0), range0)
-                    SynExpr.LetOrUseBang(DebugPointForBinding.DebugPointAtBinding range0, false, false, headPat, body, [], continuation, range0)
+                    let status = SynPat.Named(SynIdent(Ident.Create "status", None), false, None, range0)
+                    let content = SynPat.Named(SynIdent(Ident.Create contentIdent, None), false, None, range0)
+                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], [ range0 ], range0), range0)
+                    SynExpr.LetOrUseBang(DebugPointAtBinding.Yes range0, false, false, headPat, body, [], continuation, range0, { EqualsRange = Some range0 })
 
                 // for synchronous calls
                 // creates let (status, content) = {body} in {continuation}
                 let deconstructResponse body continuation =
                     let emptySynValData = SynValData.SynValData(None, SynValInfo.Empty, None)
-                    let status = SynPat.Named(SynPat.Wild range0, Ident.Create "status", false, None, range0)
-                    let content = SynPat.Named(SynPat.Wild range0, Ident.Create contentIdent, false, None, range0)
-                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], range0), range0)
-                    let binding = SynBinding.Binding(None, SynBindingKind.NormalBinding, false, false, [], PreXmlDoc.Empty, emptySynValData, headPat, None, body, range0, DebugPointForBinding.DebugPointAtBinding range0 )
-                    SynExpr.LetOrUse(false, false, [binding], continuation, range0)
+                    let status = SynPat.Named(SynIdent(Ident.Create "status", None), false, None, range0)
+                    let content = SynPat.Named(SynIdent(Ident.Create contentIdent, None), false, None, range0)
+                    let headPat = SynPat.Paren(SynPat.Tuple(false, [ status; content ], [ range0 ], range0), range0)
+                    let binding = SynBinding.SynBinding(None, SynBindingKind.Normal, false, false, [], PreXmlDoc.Empty, emptySynValData, headPat, None, body, range0, DebugPointAtBinding.Yes range0, { LeadingKeyword = SynLeadingKeyword.Let range0; InlineKeyword = None; EqualsRange = Some range0 } )
+                    SynExpr.LetOrUse(false, false, [binding], continuation, range0, SynExprLetOrUseTrivia.Zero)
 
                 let requestValues = [
                     for parameter in parameters do
@@ -2105,21 +2221,21 @@ let createOpenApiClient
 
                 let responseType =
                     if operationInfo.Extensions.ContainsKey "ResponseTypeName" then
-                        match operationInfo.Extensions.["ResponseTypeName"] with
-                        | :? Microsoft.OpenApi.Any.OpenApiString as responseTypeName -> responseTypeName.Value
-                        | _ -> capitalize memberName
+                        match extensionString operationInfo.Extensions.["ResponseTypeName"] with
+                        | Some responseTypeName -> responseTypeName
+                        | None -> capitalize memberName
                     else
                         capitalize memberName
 
                 let returnExpr =
-                    let createOutput (status: string,response: OpenApiResponse) =
-                        if response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "string" && response.Content.["application/json"].Schema.Format = "byte" then
+                    let createOutput (status: string,response: IOpenApiResponse) =
+                        if response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "string" && response.Content.["application/json"].Schema.Format = "byte" then
                             // Assume we have a binary response
                             SynExpr.CreatePartialApp([responseType; status], [
                                 createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "string" && (response.Content.["application/json"].Schema.Format = "uuid" || response.Content.["application/json"].Schema.Format = "guid") then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "string" && (response.Content.["application/json"].Schema.Format = "uuid" || response.Content.["application/json"].Schema.Format = "guid") then
                             SynExpr.CreatePartialApp([responseType; status], [
                                 SynExpr.CreateParen(
                                     SynExpr.CreatePartialApp(["Serializer"; "deserialize"], [
@@ -2128,13 +2244,13 @@ let createOpenApiClient
                                 )
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "file" then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "file" then
                             // Assume we have a binary response
                             SynExpr.CreatePartialApp([responseType; status], [
                                 createIdent [ contentIdent ]
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "string" then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "string" then
                             if hasBinaryResponse && config.target = Target.FSharp then
                                 let body = SynExpr.CreatePartialApp(["Encoding"; "UTF8"; "GetString"], [
                                     createIdent [ "contentBinary" ]
@@ -2176,7 +2292,7 @@ let createOpenApiClient
                                         createIdent [ "content" ]
                                     ])
                                     |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "integer" && config.odataSchema then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "integer" && config.odataSchema then
                             // OData Schema and integer response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
                                 SynExpr.CreateParen(
@@ -2186,7 +2302,7 @@ let createOpenApiClient
                                 )
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "boolean" && config.odataSchema then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "boolean" && config.odataSchema then
                             // OData Schema and boolean response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
                                 SynExpr.CreateParen(
@@ -2196,7 +2312,7 @@ let createOpenApiClient
                                 )
                             ])
                             |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && response.Content.["application/json"].Schema.Type = "number" && config.odataSchema then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && schemaTypeName response.Content.["application/json"].Schema = "number" && config.odataSchema then
                             // OData Schema and number response schema combo
                             SynExpr.CreatePartialApp([responseType; status], [
                                 SynExpr.CreateParen(
@@ -2248,7 +2364,7 @@ let createOpenApiClient
                                     )
                                 ])
                                 |> wrappedReturn
-                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && isEmptySchema response.Content.["application/json"].Schema && (isNotNull response.Content.["application/json"].Schema.AdditionalProperties || response.Content.["application/json"].Schema.Type = "object") then
+                        elif response.Content.ContainsKey "application/json" && isNotNull response.Content.["application/json"].Schema && isEmptySchema response.Content.["application/json"].Schema && (isNotNull response.Content.["application/json"].Schema.AdditionalProperties || schemaTypeName response.Content.["application/json"].Schema = "object") then
                             if hasBinaryResponse && config.target = Target.FSharp then
                                 let body = SynExpr.CreatePartialApp(["Encoding"; "UTF8"; "GetString"], [
                                     createIdent [ "contentBinary" ]
@@ -2464,23 +2580,25 @@ let createOpenApiClient
                         let (status, _) = openApiResponse
                         let ident = SynPat.Const(SynConst.Int32 (statusCode status), range0)
 
-                        SynMatchClause.Clause (
+                        SynMatchClause.SynMatchClause (
                             ident,
                             None,
                             createOutput openApiResponse,
                             range0,
-                            DebugPointForTarget.Yes
+                            DebugPointAtTarget.Yes,
+                            { ArrowRange = Some range0; BarRange = Some range0 }
                         )
                     if responses.Length = 1 then
                         createOutput responses.[0]
                     else
                         let matchWildClause openApiResponse =
-                            SynMatchClause.Clause (
+                            SynMatchClause.SynMatchClause (
                                 SynPat.Wild range0,
                                 None,
                                 createOutput openApiResponse,
                                 range0,
-                                DebugPointForTarget.Yes
+                                DebugPointAtTarget.Yes,
+                                { ArrowRange = Some range0; BarRange = Some range0 }
                         )
 
                         let responsesRevSorted =
@@ -2536,7 +2654,7 @@ let createOpenApiClient
                             )
 
                         Pattern =
-                            SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString $"this.{name}", [
+                            SynPatRcd.CreateLongIdent(SynLongIdent.CreateString $"this.{name}", [
                                 SynPatRcd.CreateParen(
                                     SynPatRcd.Tuple {
                                         Patterns = [
@@ -2546,7 +2664,7 @@ let createOpenApiClient
                                                     Type = parameter.parameterType
                                                     Pattern =
                                                         if parameter.required
-                                                        then SynPatRcd.CreateLongIdent(LongIdentWithDots.CreateString(parameter.parameterIdent), [])
+                                                        then SynPatRcd.CreateLongIdent(SynLongIdent.CreateString(parameter.parameterIdent), [])
                                                         else SynPatRcd.OptionalVal {
                                                             Range = range0
                                                             Id = Ident.Create parameter.parameterIdent
@@ -2603,7 +2721,7 @@ let rec deleteFilesAndFolders directory isRoot =
         if not isRoot then Directory.Delete subdirectory
 
 let path xs = Path.Combine(Array.ofList xs)
-let write content filePath = File.WriteAllText(path filePath, content)
+let write (content: string) filePath = File.WriteAllText(path filePath, content)
 
 let generateProjectDocument
     (packageReferences: XElement seq)
@@ -2700,8 +2818,8 @@ let preprocessRelativeExternalReferences (schema: JObject) (url: string) =
 
 
 type ExternalResouceLoader(schema: string) =
-    interface Interface.IStreamLoader with
-        member self.Load(uri: Uri) =
+    interface IStreamLoader with
+        member self.LoadAsync(baseUri: Uri, uri: Uri, cancellationToken: System.Threading.CancellationToken) =
             let absoluteUri =
                 if not uri.IsAbsoluteUri then
                     Uri(Uri(schema), uri.OriginalString)
@@ -2709,17 +2827,122 @@ type ExternalResouceLoader(schema: string) =
                     uri
 
             client.GetStreamAsync(absoluteUri)
-            |> Async.AwaitTask
-            |> Async.RunSynchronously
 
-        member self.LoadAsync(uri: Uri) =
-            let absoluteUri =
-                if not uri.IsAbsoluteUri then
-                    Uri(Uri(schema), uri.OriginalString)
-                else
-                    uri
+/// Microsoft.OpenApi 3.x leaves optional collections null when they are absent
+/// from the document, whereas the 1.x model always initialized them empty. The
+/// generator relies on the old behaviour, so this walks the freshly-parsed
+/// document and fills in empty collections.
+let normalizeDocument (document: OpenApiDocument) =
+    if isNotNull (box document) then
+        let emptyExtensions () : IDictionary<string, IOpenApiExtension> = upcast Dictionary<string, IOpenApiExtension>()
+        let visitedSchemas = HashSet<IOpenApiSchema>(HashIdentity.Reference)
 
-            client.GetStreamAsync(absoluteUri)
+        let rec normalizeSchema (schema: IOpenApiSchema) =
+            if isNotNull (box schema) && visitedSchemas.Add schema then
+                match box schema with
+                | :? OpenApiSchema as concrete ->
+                    if isNull concrete.Required then concrete.Required <- HashSet<string>()
+                    if isNull concrete.Extensions then concrete.Extensions <- emptyExtensions()
+                    if isNull concrete.Enum then concrete.Enum <- ResizeArray<JsonNode>()
+                    if isNull concrete.AllOf then concrete.AllOf <- ResizeArray<IOpenApiSchema>()
+                    if isNull concrete.AnyOf then concrete.AnyOf <- ResizeArray<IOpenApiSchema>()
+                    if isNull concrete.OneOf then concrete.OneOf <- ResizeArray<IOpenApiSchema>()
+                    if isNull concrete.Properties then concrete.Properties <- Dictionary<string, IOpenApiSchema>()
+                    for property in concrete.Properties do normalizeSchema property.Value
+                    for inner in concrete.AllOf do normalizeSchema inner
+                    for inner in concrete.AnyOf do normalizeSchema inner
+                    for inner in concrete.OneOf do normalizeSchema inner
+                    normalizeSchema concrete.Items
+                    normalizeSchema concrete.AdditionalProperties
+                | _ ->
+                    // a $ref - its target is normalized where it is defined
+                    ()
+
+        let normalizeMediaTypes (content: IDictionary<string, IOpenApiMediaType>) =
+            if isNotNull content then
+                for media in content.Values do
+                    if isNotNull (box media) then normalizeSchema media.Schema
+
+        let normalizeParameter (parameter: IOpenApiParameter) =
+            match box parameter with
+            | :? OpenApiParameter as concrete ->
+                if isNull concrete.Extensions then concrete.Extensions <- emptyExtensions()
+                if isNull concrete.Content then concrete.Content <- Dictionary<string, IOpenApiMediaType>()
+                normalizeSchema concrete.Schema
+                normalizeMediaTypes concrete.Content
+            | _ -> ()
+
+        let normalizeResponse (response: IOpenApiResponse) =
+            match box response with
+            | :? OpenApiResponse as concrete ->
+                if isNull concrete.Extensions then concrete.Extensions <- emptyExtensions()
+                if isNull concrete.Content then concrete.Content <- Dictionary<string, IOpenApiMediaType>()
+                if isNull concrete.Headers then concrete.Headers <- Dictionary<string, IOpenApiHeader>()
+                normalizeMediaTypes concrete.Content
+            | _ -> ()
+
+        let normalizeRequestBody (body: IOpenApiRequestBody) =
+            match box body with
+            | :? OpenApiRequestBody as concrete ->
+                if isNull concrete.Extensions then concrete.Extensions <- emptyExtensions()
+                if isNull concrete.Content then concrete.Content <- Dictionary<string, IOpenApiMediaType>()
+                normalizeMediaTypes concrete.Content
+            | _ -> ()
+
+        let normalizeOperation (operation: OpenApiOperation) =
+            if isNotNull (box operation) then
+                if isNull operation.Extensions then operation.Extensions <- emptyExtensions()
+                if isNull operation.Parameters then operation.Parameters <- ResizeArray<IOpenApiParameter>()
+                if isNull operation.Tags then operation.Tags <- HashSet<OpenApiTagReference>()
+                if isNull operation.Responses then operation.Responses <- OpenApiResponses()
+                for parameter in operation.Parameters do normalizeParameter parameter
+                for response in operation.Responses.Values do normalizeResponse response
+                if isNotNull (box operation.RequestBody) then normalizeRequestBody operation.RequestBody
+
+        if isNull document.Extensions then document.Extensions <- emptyExtensions()
+
+        if isNotNull document.Components then
+            let components = document.Components
+            if isNotNull components.Schemas then
+                for schema in components.Schemas.Values do normalizeSchema schema
+            if isNotNull components.Responses then
+                for response in components.Responses.Values do normalizeResponse response
+            if isNotNull components.Parameters then
+                for parameter in components.Parameters.Values do normalizeParameter parameter
+            if isNotNull components.RequestBodies then
+                for body in components.RequestBodies.Values do normalizeRequestBody body
+
+        if isNotNull document.Paths then
+            for pathItem in document.Paths.Values do
+                if isNotNull (box pathItem) then
+                    match box pathItem with
+                    | :? OpenApiPathItem as concrete ->
+                        if isNull concrete.Parameters then concrete.Parameters <- ResizeArray<IOpenApiParameter>()
+                    | _ -> ()
+                    if isNotNull pathItem.Parameters then
+                        for parameter in pathItem.Parameters do normalizeParameter parameter
+                    if isNotNull pathItem.Operations then
+                        for operation in pathItem.Operations.Values do normalizeOperation operation
+
+/// Reads and parses an OpenAPI/Swagger document from a JSON or YAML stream
+/// using the Microsoft.OpenApi 3.x reader (supports OpenAPI 2.0, 3.0 and 3.1).
+let loadOpenApiDocument (schema: Stream) (config: CodegenConfig) : OpenApiDocument * OpenApiDiagnostic =
+    let settings = OpenApiReaderSettings()
+    settings.AddYamlReader()
+    if config.schema.StartsWith "http" then
+        // customize how external references are resolved
+        settings.CustomExternalLoader <- ExternalResouceLoader(config.schema) :> IStreamLoader
+        settings.LoadExternalRefs <- true
+    let format =
+        if config.schema.EndsWith ".yaml" || config.schema.EndsWith ".yml"
+        then "yaml"
+        else "json"
+    let result =
+        OpenApiModelFactory.LoadAsync(schema, format, settings)
+        |> Async.AwaitTask
+        |> Async.RunSynchronously
+    normalizeDocument result.Document
+    result.Document, result.Diagnostic
 
 let runConfig filePath =
     let config = resolveFile filePath
@@ -2754,18 +2977,7 @@ let runConfig filePath =
                 getSchema config.schema config.overrideSchema
             else
                 getSchema (resolveFile config.schema) config.overrideSchema
-        let settings = OpenApiReaderSettings()
-        settings.ReferenceResolution <- ReferenceResolutionSetting.ResolveAllReferences
-        if config.schema.StartsWith "http" then
-            // customize how external references are resolved
-            settings.CustomExternalLoader <- new ExternalResouceLoader(config.schema)
-        let reader = new OpenApiStreamReader(settings)
-        let openApi =
-            reader.ReadAsync(schema)
-            |> Async.AwaitTask
-            |> Async.RunSynchronously
-
-        let (openApiDocument, diagnostics) = openApi.OpenApiDocument, openApi.OpenApiDiagnostic
+        let openApiDocument, diagnostics = loadOpenApiDocument schema config
         if diagnostics.Errors.Count > 0 && isNull openApiDocument then
             for error in diagnostics.Errors do
                 System.Console.WriteLine error.Message
@@ -2788,8 +3000,7 @@ let runConfig filePath =
             let projectFile =
                 let packages = [
                     if config.target = Target.FSharp then
-                        XElement.PackageReference("Fable.Remoting.Json", "2.18.0")
-                        XElement.PackageReference("Newtonsoft.Json", "13.0.1")
+                        XElement.PackageReference("FSharp.SystemTextJson", "1.4.36")
                         if config.asyncReturnType = AsyncReturnType.Task
                         then XElement.PackageReference("Ply", "0.3.1")
                     else
@@ -2798,9 +3009,6 @@ let runConfig filePath =
                 ]
 
                 let files = [
-                    if config.target = Target.FSharp then
-                        XElement.Compile "StringEnum.fs"
-
                     XElement.Compile "OpenApiHttp.fs"
                     XElement.Compile "Types.fs"
                     XElement.Compile "Client.fs"
@@ -2814,7 +3022,6 @@ let runConfig filePath =
             if config.target = Target.FSharp then
                 let httpLibrary = HttpLibrary.library (config.asyncReturnType = AsyncReturnType.Task) config.project
                 write httpLibrary [ outputDir; "OpenApiHttp.fs" ]
-                write CodeGen.stringEnumAttr [ outputDir; "StringEnum.fs" ]
             else
                 let httpLibrary = HttpLibrary.fableLibrary config.project
                 write httpLibrary [ outputDir; "OpenApiHttp.fs" ]
@@ -2856,18 +3063,7 @@ let showTags filePath =
                 getSchema config.schema config.overrideSchema
             else
                 getSchema (resolveFile config.schema) config.overrideSchema
-        let settings = OpenApiReaderSettings()
-        settings.ReferenceResolution <- ReferenceResolutionSetting.ResolveAllReferences
-        if config.schema.StartsWith "http" then
-            // customize how external references are resolved
-            settings.CustomExternalLoader <- new ExternalResouceLoader(config.schema)
-        let reader = new OpenApiStreamReader(settings)
-        let openApi =
-            reader.ReadAsync(schema)
-            |> Async.AwaitTask
-            |> Async.RunSynchronously
-
-        let (openApiDocument, diagnostics) = openApi.OpenApiDocument, openApi.OpenApiDiagnostic
+        let openApiDocument, diagnostics = loadOpenApiDocument schema config
         if diagnostics.Errors.Count > 0 && isNull openApiDocument then
             for error in diagnostics.Errors do
                 Console.WriteLine error.Message

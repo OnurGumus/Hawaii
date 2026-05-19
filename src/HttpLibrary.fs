@@ -7,18 +7,23 @@ open System.Net.Http
 open System.Globalization
 open System.Collections.Generic
 open System.Text
-open Fable.Remoting.Json
 open System.Threading
 {taskLibrary}
 
 module Serializer =
-    open Newtonsoft.Json
-    let converter = FableJsonConverter() :> JsonConverter
-    let settings = JsonSerializerSettings(Converters=[| converter |])
-    settings.DateParseHandling <- DateParseHandling.None
-    settings.NullValueHandling <- NullValueHandling.Ignore
-    let serialize<'t> (value: 't) = JsonConvert.SerializeObject(value, settings)
-    let deserialize<'t> (content: string) = JsonConvert.DeserializeObject<'t>(content, settings)
+    open System.Text.Json
+    open System.Text.Json.Serialization
+    let private fsharpOptions =
+        JsonFSharpOptions.Default()
+            .WithUnionUnwrapFieldlessTags()
+            .WithSkippableOptionFields()
+            .WithAllowOverride(true)
+    let options =
+        let o = JsonSerializerOptions(DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)
+        o.Converters.Add(JsonFSharpConverter(fsharpOptions))
+        o
+    let serialize<'t> (value: 't) = JsonSerializer.Serialize(value, options)
+    let deserialize<'t> (content: string) = JsonSerializer.Deserialize<'t>(content, options)
 
 [<RequireQualifiedAccess>]
 type OpenApiValue =
@@ -124,6 +129,9 @@ type RequestPart =
         MultiPartFormData(key, Primitive(OpenApiValue.String (value.ToString("O"))))
     static member multipartFormData(key: string, value: byte[]) =
         MultiPartFormData(key, File value)
+    // a structured (object/array) form-data field is sent as its compact JSON text
+    static member multipartFormData(key: string, value: System.Text.Json.Nodes.JsonNode) =
+        MultiPartFormData(key, Primitive(OpenApiValue.String(value.ToJsonString())))
     static member multipartFormData(key: string, values: string list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String value ]))
     static member multipartFormData(key: string, values: Guid list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String (value.ToString()) ]))
     static member multipartFormData(key: string, values: int list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.Int value ]))
@@ -378,6 +386,49 @@ module OpenApiHttp =
 
     let headBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
         headBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    // OpenAPI 3.2 QUERY method - a safe, idempotent request that carries a body
+    let queryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendAsync httpClient (HttpMethod "QUERY") path parts {cancellationParameter}
+
+    let query (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        queryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let queryBinaryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendBinaryAsync httpClient (HttpMethod "QUERY") path parts {cancellationParameter}
+
+    let queryBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        queryBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let optionsAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendAsync httpClient (HttpMethod "OPTIONS") path parts {cancellationParameter}
+
+    let options (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        optionsAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let optionsBinaryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendBinaryAsync httpClient (HttpMethod "OPTIONS") path parts {cancellationParameter}
+
+    let optionsBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        optionsBinaryAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let traceAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendAsync httpClient (HttpMethod "TRACE") path parts {cancellationParameter}
+
+    let trace (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        traceAsync httpClient path parts {cancellationParameter}
+        {convertSync}
+
+    let traceBinaryAsync (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        sendBinaryAsync httpClient (HttpMethod "TRACE") path parts {cancellationParameter}
+
+    let traceBinary (httpClient: HttpClient) (path: string) (parts: RequestPart list) {cancellationArgument} =
+        traceBinaryAsync httpClient path parts {cancellationParameter}
         {convertSync}
 """
 
@@ -670,6 +721,9 @@ type RequestPart =
         MultiPartFormData(key, Primitive(OpenApiValue.String (value.ToString("O"))))
     static member multipartFormData(key: string, value: File) =
         MultiPartFormData(key, File value)
+    // a structured (object/array) form-data field is sent as its JSON text
+    static member multipartFormData(key: string, value: obj) =
+        MultiPartFormData(key, Primitive(OpenApiValue.String(JS.JSON.stringify value)))
     static member multipartFormData(key: string, values: string list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String value ]))
     static member multipartFormData(key: string, values: Guid list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.String (value.ToString()) ]))
     static member multipartFormData(key: string, values: int list) = MultiPartFormData(key, Primitive(OpenApiValue.List [ for value in values -> OpenApiValue.Int value ]))
@@ -876,6 +930,28 @@ module OpenApiHttp =
 
     let headBinaryAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
         sendBinaryAsync HEAD basePath path extraHeaders parts
+
+    // OpenAPI 3.2 QUERY method. Fable.SimpleHttp's HttpMethod has no QUERY case,
+    // so the request falls back to POST - the closest method that carries a body.
+    let queryAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendAsync POST basePath path extraHeaders parts
+
+    let queryBinaryAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendBinaryAsync POST basePath path extraHeaders parts
+
+    let optionsAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendAsync OPTIONS basePath path extraHeaders parts
+
+    let optionsBinaryAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendBinaryAsync OPTIONS basePath path extraHeaders parts
+
+    // The browser fetch/XHR APIs forbid the TRACE method, and Fable.SimpleHttp's
+    // HttpMethod has no TRACE case, so this falls back to GET.
+    let traceAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendAsync GET basePath path extraHeaders parts
+
+    let traceBinaryAsync (basePath: string) (path: string) (extraHeaders: Header list) (parts: RequestPart list) =
+        sendBinaryAsync GET basePath path extraHeaders parts
 """
 
 let fableLibrary (projectName: string) = fableContent.Replace("{projectName}", projectName)

@@ -2,10 +2,10 @@
 module FsAst.AstRcd
 
 open System
-open FSharp.Compiler.Text
-open FSharp.Compiler.SyntaxTree
-open FSharp.Compiler.XmlDoc
-
+open Fantomas.FCS.Text
+open Fantomas.FCS.Syntax
+open Fantomas.FCS.SyntaxTrivia
+open Fantomas.FCS.Xml
 
 type ParsedImplFileInputRcd = {
     File: string
@@ -18,11 +18,11 @@ type ParsedImplFileInputRcd = {
     IsExe: bool }
 with
     member x.FromRcd =
-        ParsedImplFileInput(x.File, x.IsScript, x.QualName, x.Pragmas, x.HashDirectives, x.Modules, (x.IsLastCompiland, x.IsExe))
+        ParsedImplFileInput(x.File, x.IsScript, x.QualName, x.Pragmas, x.HashDirectives, x.Modules, (x.IsLastCompiland, x.IsExe), { ConditionalDirectives = []; CodeComments = [] }, Set.empty)
 
 type ParsedImplFileInput with
     member x.ToRcd =
-        let (ParsedImplFileInput(file, isScript, qualName, pragmas, hashDirectives, modules, (isLastCompiland, isExe))) = x
+        let (ParsedImplFileInput(file, isScript, qualName, pragmas, hashDirectives, modules, (isLastCompiland, isExe), _trivia, _identifiers)) = x
         { File = file; IsScript = isScript; QualName = qualName; Pragmas = pragmas; HashDirectives = hashDirectives; Modules = modules; IsLastCompiland = isLastCompiland; IsExe = isExe }
 
 type SynModuleOrNamespaceRcd = {
@@ -36,16 +36,22 @@ type SynModuleOrNamespaceRcd = {
     Range: range }
 with
     member x.FromRcd =
-        SynModuleOrNamespace(x.Id, x.IsRecursive, x.Kind, x.Declarations, x.XmlDoc, x.Attributes, x.Access, x.Range)
+        let leadingKeyword =
+            match x.Kind with
+            | SynModuleOrNamespaceKind.DeclaredNamespace
+            | SynModuleOrNamespaceKind.GlobalNamespace -> SynModuleOrNamespaceLeadingKeyword.Namespace range.Zero
+            | SynModuleOrNamespaceKind.NamedModule
+            | SynModuleOrNamespaceKind.AnonModule -> SynModuleOrNamespaceLeadingKeyword.Module range.Zero
+        SynModuleOrNamespace(x.Id, x.IsRecursive, x.Kind, x.Declarations, x.XmlDoc, x.Attributes, x.Access, x.Range, { LeadingKeyword = leadingKeyword })
 
 type SynModuleOrNamespace with
     member x.ToRcd =
-        let (SynModuleOrNamespace(id, isRecursive, kind, declarations, xmlDoc, attributes, access, range)) = x
+        let (SynModuleOrNamespace(id, isRecursive, kind, declarations, xmlDoc, attributes, access, range, _trivia)) = x
         { Id = id; IsRecursive = isRecursive; Kind = kind; Declarations = declarations; XmlDoc = xmlDoc; Attributes = attributes; Access = access; Range = range }
 
 type SynComponentInfoRcd = {
     Attributes: SynAttributes
-    Parameters: SynTyparDecl list
+    Parameters: SynTyparDecls option
     Constraints: SynTypeConstraint list
     Id: LongIdent
     XmlDoc: PreXmlDoc
@@ -54,11 +60,11 @@ type SynComponentInfoRcd = {
     Range: range }
 with
     member x.FromRcd =
-        ComponentInfo(x.Attributes, x.Parameters, x.Constraints, x.Id, x.XmlDoc, x.PreferPostfix, x.Access, x.Range)
+        SynComponentInfo(x.Attributes, x.Parameters, x.Constraints, x.Id, x.XmlDoc, x.PreferPostfix, x.Access, x.Range)
 
 type SynComponentInfo with
     member x.ToRcd =
-        let (ComponentInfo(attributes, parameters, constraints, id, xmldoc, preferPostfix, access, range)) = x
+        let (SynComponentInfo(attributes, parameters, constraints, id, xmldoc, preferPostfix, access, range)) = x
         { Attributes = attributes; Parameters = parameters; Constraints = constraints; Id = id; XmlDoc = xmldoc; PreferPostfix = preferPostfix; Access = access; Range = range }
 
 type SynTypeDefnRcd = {
@@ -68,11 +74,26 @@ type SynTypeDefnRcd = {
     Range: range }
 with
     member x.FromRcd =
-        TypeDefn(x.Info.FromRcd, x.Repr, x.Members, x.Range)
+        // Fantomas 7 expects the implicit constructor in the dedicated SynTypeDefn slot,
+        // not inside the members list. Hawaii puts it in the ObjectModel repr's members,
+        // so lift it out into the implicitConstructor argument.
+        let isImplicitCtor = function SynMemberDefn.ImplicitCtor _ -> true | _ -> false
+        let allMembers =
+            match x.Repr with
+            | SynTypeDefnRepr.ObjectModel(_, reprMembers, _) -> List.append reprMembers x.Members
+            | _ -> x.Members
+        let implicitCtor = allMembers |> List.tryFind isImplicitCtor
+        let repr =
+            match x.Repr with
+            | SynTypeDefnRepr.ObjectModel(kind, reprMembers, reprRange) ->
+                SynTypeDefnRepr.ObjectModel(kind, reprMembers |> List.filter (isImplicitCtor >> not), reprRange)
+            | other -> other
+        let members = x.Members |> List.filter (isImplicitCtor >> not)
+        SynTypeDefn(x.Info.FromRcd, repr, members, implicitCtor, x.Range, { LeadingKeyword = SynTypeDefnLeadingKeyword.Type range.Zero; EqualsRange = Some range.Zero; WithKeyword = None })
 
 type SynTypeDefn with
     member x.ToRcd =
-        let (TypeDefn(info, repr, members, range)) = x
+        let (SynTypeDefn(info, repr, members, _implicitCtor, range, _trivia)) = x
         { Info = info.ToRcd; Repr = repr; Members = members; Range = range }
 
 type SynTypeDefnReprObjectModelRcd = {
@@ -136,8 +157,7 @@ type SynPatRcd =
     /// <summary>A type test pattern ':? typeName'</summary>
     | IsInstance of SynPatIsInstanceRcd
     | Record of SynPatRecordRcd
-    | QuoteExpr of SynPatQuoteExprRcd 
-    | DeprecatedCharRange of SynPatDeprecatedCharRangeRcd
+    | QuoteExpr of SynPatQuoteExprRcd
     | InstanceMember of SynPatInstanceMemberRcd
     | FromParseError of SynPatFromParseErrorRcd
 
@@ -165,22 +185,22 @@ and SynPatOptionalValRcd = {
     Range: range
 }
 
-and SynPatOrRcd = { 
+and SynPatOrRcd = {
     Left: SynPatRcd
-    Right: SynPatRcd 
+    Right: SynPatRcd
     Range: range }
 
-and SynPatAndsRcd = { 
-    Patterns: SynPatRcd list 
+and SynPatAndsRcd = {
+    Patterns: SynPatRcd list
     Range: range }
 
 and SynPatArrayOrListRcd = {
-    IsArray: bool 
+    IsArray: bool
     Elements: SynPatRcd list
     Range: range }
 
 and SynPatIsInstanceRcd = {
-    Type : SynType 
+    Type : SynType
     Range : range }
 
 and SynPatRecordRcd = {
@@ -192,11 +212,6 @@ and SynPatQuoteExprRcd = {
     Expr : SynExpr
     Range : range
 }
-
-and SynPatDeprecatedCharRangeRcd = {
-    StartChar: char
-    EndChar: char
-    Range : range }
 
 and SynPatInstanceMemberRcd = {
     ThisId: Ident
@@ -215,7 +230,7 @@ and SynPatAttribRcd = {
     Range: range }
 
 and SynPatLongIdentRcd = {
-    Id: LongIdentWithDots
+    Id: SynLongIdent
     ExtraId : Ident option
     TyparDecls : SynValTyparDecls option
     Args: SynArgPats
@@ -248,11 +263,10 @@ type SynPatRcd  with
         | OptionalVal n -> n.FromRcd
         | Or n -> n.FromRcd
         | Ands n -> n.FromRcd
-        | ArrayOrList n -> n.FromRcd 
+        | ArrayOrList n -> n.FromRcd
         | IsInstance n -> n.FromRcd
         | Record n -> n.FromRcd
         | QuoteExpr n -> n.FromRcd
-        | DeprecatedCharRange n -> n.FromRcd
         | InstanceMember n -> n.FromRcd
         | FromParseError n -> n.FromRcd
 
@@ -261,7 +275,7 @@ and SynPatConstRcd with
 and SynPatWildRcd with
     member x.FromRcd = SynPat.Wild(x.Range)
 and SynPatNamedRcd with
-    member x.FromRcd = SynPat.Named(x.Pattern.FromRcd, x.Id, x.IsThis, x.Access, x.Range)
+    member x.FromRcd = SynPat.Named(SynIdent(x.Id, None), x.IsThis, x.Access, x.Range)
 and SynPatTypedRcd with
     member x.FromRcd = SynPat.Typed(x.Pattern.FromRcd, x.Type, x.Range)
 and SynPatAttribRcd with
@@ -269,32 +283,34 @@ and SynPatAttribRcd with
 and SynPatLongIdentRcd with
     member x.FromRcd = SynPat.LongIdent(x.Id, x.ExtraId, x.TyparDecls, x.Args, x.Access, x.Range)
 and SynPatTupleRcd with
-    member x.FromRcd = SynPat.Tuple(false, x.Patterns |> List.map (fun p -> p.FromRcd), x.Range)
+    member x.FromRcd =
+        match x.Patterns |> List.map (fun p -> p.FromRcd) with
+        | [] -> SynPat.Const(SynConst.Unit, x.Range)
+        | [ single ] -> single
+        | pats -> SynPat.Tuple(false, pats, List.replicate (pats.Length - 1) x.Range, x.Range)
 and SynPatParenRcd with
     member x.FromRcd = SynPat.Paren(x.Pattern.FromRcd, x.Range)
 and SynPatNullRcd with
     member x.FromRcd = SynPat.Null(x.Range)
-and SynPatOptionalValRcd with 
+and SynPatOptionalValRcd with
     member x.FromRcd = SynPat.OptionalVal(x.Id, x.Range)
-and SynPatOrRcd with 
-    member x.FromRcd = SynPat.Or(x.Left.FromRcd, x.Right.FromRcd, x.Range)
-and SynPatAndsRcd with 
+and SynPatOrRcd with
+    member x.FromRcd = SynPat.Or(x.Left.FromRcd, x.Right.FromRcd, x.Range, { BarRange = x.Range })
+and SynPatAndsRcd with
     member x.FromRcd = SynPat.Ands(x.Patterns |> List.map (fun pat -> pat.FromRcd), x.Range)
-and SynPatArrayOrListRcd with 
+and SynPatArrayOrListRcd with
     member x.FromRcd = SynPat.ArrayOrList(x.IsArray, x.Elements |> List.map (fun pat -> pat.FromRcd), x.Range)
-and SynPatIsInstanceRcd with 
+and SynPatIsInstanceRcd with
     member x.FromRcd = SynPat.IsInst(x.Type, x.Range)
-and SynPatRecordRcd with 
+and SynPatRecordRcd with
     member x.FromRcd =
-        let fields = [ for ((idents, ident), pattern) in x.Fields -> ((idents, ident), pattern.FromRcd) ]
+        let fields = [ for ((idents, ident), pattern) in x.Fields -> ((idents, ident), None, pattern.FromRcd) ]
         SynPat.Record(fields, x.Range)
-and SynPatQuoteExprRcd with 
+and SynPatQuoteExprRcd with
     member x.FromRcd = SynPat.QuoteExpr(x.Expr, x.Range)
-and SynPatDeprecatedCharRangeRcd with 
-    member x.FromRcd = SynPat.DeprecatedCharRange(x.StartChar, x.EndChar, x.Range)
-and SynPatInstanceMemberRcd with 
+and SynPatInstanceMemberRcd with
     member x.FromRcd = SynPat.InstanceMember(x.ThisId, x.MemberId, x.ToolingId, x.Accessibility, x.Range)
-and SynPatFromParseErrorRcd with 
+and SynPatFromParseErrorRcd with
     member x.FromRcd = SynPat.FromParseError(x.Pattern.FromRcd, x.Range)
 type SynPat with
     member x.ToRcd =
@@ -303,32 +319,32 @@ type SynPat with
             SynPatRcd.Const { Const = cnst; Range = range }
         | SynPat.Wild range ->
             SynPatRcd.Wild { Range = range }
-        | SynPat.Named(pattern, id, isThis, access, range) ->
-            SynPatRcd.Named { Pattern = pattern.ToRcd; Id = id; IsThis = isThis; Access = access; Range = range }
+        | SynPat.Named(SynIdent(id, _), isThis, access, range) ->
+            SynPatRcd.Named { Pattern = SynPatRcd.Wild { Range = range }; Id = id; IsThis = isThis; Access = access; Range = range }
         | SynPat.Typed(pattern, typ, range) ->
             SynPatRcd.Typed { Pattern = pattern.ToRcd; Type = typ; Range = range }
         | SynPat.Attrib(pattern, attributes, range) ->
             SynPatRcd.Attrib { Pattern = pattern.ToRcd; Attributes = attributes; Range = range }
-        | SynPat.Or(left, right, range) -> 
+        | SynPat.Or(left, right, range, _trivia) ->
             SynPatRcd.Or { Left = left.ToRcd; Right = right.ToRcd; Range = range }
-        | SynPat.Ands(patterns, range) -> 
+        | SynPat.Ands(patterns, range) ->
             SynPatRcd.Ands { Patterns = patterns |> List.map (fun pat -> pat.ToRcd); Range = range }
         | SynPat.LongIdent(id, extraId, typarDecls , args, access, range) ->
             SynPatRcd.LongIdent { Id = id; ExtraId = extraId; TyparDecls = typarDecls; Args = args; Access = access; Range = range }
-        | SynPat.Tuple(_, patterns, range) ->
+        | SynPat.Tuple(_, patterns, _, range) ->
             SynPatRcd.Tuple { Patterns = patterns |> List.map (fun p -> p.ToRcd); Range = range }
         | SynPat.Paren(pattern, range) ->
             SynPatRcd.Paren { Pattern = pattern.ToRcd; Range = range }
-        | SynPat.ArrayOrList(isArray, elementPatterns, range) -> 
+        | SynPat.ArrayOrList(isArray, elementPatterns, range) ->
             SynPatRcd.ArrayOrList {
                 IsArray = isArray
                 Elements = elementPatterns |> List.map (fun p -> p.ToRcd)
                 Range = range
             }
-        | SynPat.Record(fields, range) -> 
+        | SynPat.Record(fields, range) ->
             SynPatRcd.Record {
-                Fields = [ 
-                    for ((idents, ident), pat) in fields -> 
+                Fields = [
+                    for ((idents, ident), _eqRange, pat) in fields ->
                         ((idents, ident), pat.ToRcd)
                 ]
 
@@ -337,28 +353,21 @@ type SynPat with
 
         | SynPat.Null range ->
             SynPatRcd.Null { Range = range }
-        | SynPat.OptionalVal (ident, range) -> 
+        | SynPat.OptionalVal (ident, range) ->
             SynPatRcd.OptionalVal { Id = ident; Range = range }
-        | SynPat.IsInst(typeToTest, range) -> 
+        | SynPat.IsInst(typeToTest, range) ->
             SynPatRcd.IsInstance {
                 Type = typeToTest
                 Range = range
             }
 
-        | SynPat.QuoteExpr(expr, range) -> 
+        | SynPat.QuoteExpr(expr, range) ->
             SynPatRcd.QuoteExpr {
                 Expr = expr
                 Range = range
             }
 
-        | SynPat.DeprecatedCharRange(startChar, endChar, range) -> 
-            SynPatRcd.DeprecatedCharRange {
-                StartChar = startChar
-                EndChar = endChar
-                Range = range
-            }
-
-        | SynPat.InstanceMember(thisId, memberId, toolingId, accessibility, range) -> 
+        | SynPat.InstanceMember(thisId, memberId, toolingId, accessibility, range) ->
             SynPatRcd.InstanceMember {
                 ThisId = thisId
                 MemberId = memberId
@@ -367,11 +376,12 @@ type SynPat with
                 Range = range
             }
 
-        | SynPat.FromParseError(pattern, range) -> 
+        | SynPat.FromParseError(pattern, range) ->
             SynPatRcd.FromParseError {
                 Pattern = pattern.ToRcd
                 Range = range
             }
+        | other -> failwithf "Unsupported SynPat case: %A" other
 
 type SynBindingReturnInfoRcd = {
     Type: SynType
@@ -379,11 +389,11 @@ type SynBindingReturnInfoRcd = {
     Attributes: SynAttributes
     }
 with
-    member x.FromRcd = SynBindingReturnInfo(x.Type, x.Range, x.Attributes)
+    member x.FromRcd = SynBindingReturnInfo(x.Type, x.Range, x.Attributes, { ColonRange = None })
 
 type SynBindingReturnInfo with
     member x.ToRcd =
-        let (SynBindingReturnInfo(typ, range, attributes)) = x
+        let (SynBindingReturnInfo(typ, range, attributes, _trivia)) = x
         { Type = typ; Range = range; Attributes = attributes }
 
 type SynBindingRcd = {
@@ -398,14 +408,21 @@ type SynBindingRcd = {
     ReturnInfo: SynBindingReturnInfoRcd option
     Expr: SynExpr
     Range: range
-    Bind: DebugPointForBinding }
+    Bind: DebugPointAtBinding }
 with
     member x.FromRcd =
-        Binding(x.Access, x.Kind, x.IsInline, x.IsMutable, x.Attributes, x.XmlDoc, x.ValData, x.Pattern.FromRcd, x.ReturnInfo |> Option.map (fun ri -> ri.FromRcd), x.Expr, x.Range, x.Bind)
+        let leadingKeyword =
+            match x.ValData with
+            | SynValData(Some memberFlags, _, _) ->
+                if not memberFlags.IsInstance
+                then SynLeadingKeyword.StaticMember(range.Zero, range.Zero)
+                else SynLeadingKeyword.Member range.Zero
+            | _ -> SynLeadingKeyword.Let range.Zero
+        SynBinding(x.Access, x.Kind, x.IsInline, x.IsMutable, x.Attributes, x.XmlDoc, x.ValData, x.Pattern.FromRcd, x.ReturnInfo |> Option.map (fun ri -> ri.FromRcd), x.Expr, x.Range, x.Bind, { LeadingKeyword = leadingKeyword; InlineKeyword = None; EqualsRange = Some range.Zero })
 
 type SynBinding with
     member x.ToRcd =
-        let (Binding(access, kind, isInline, isMutable, attrs, xmlDoc, info, pattern, returnInfo, rhsExpr, mBind, spBind)) = x
+        let (SynBinding(access, kind, isInline, isMutable, attrs, xmlDoc, info, pattern, returnInfo, rhsExpr, mBind, spBind, _trivia)) = x
         { Access = access; Kind = kind; IsInline = isInline; IsMutable = isMutable; Attributes = attrs; XmlDoc = xmlDoc; ValData = info; Pattern = pattern.ToRcd; ReturnInfo = returnInfo |> Option.map (fun ri -> ri.ToRcd); Expr = rhsExpr; Range = mBind; Bind = spBind }
 
 [<RequireQualifiedAccess>]
@@ -435,20 +452,14 @@ and  SynTypeDefnSimpleReprRecordRcd = {
 and SynTypeDefnSimpleReprGeneralRcd = {
     Kind: SynTypeDefnKind
     // TODO incomplete
-    // (SynType * range * Ident option) list
-    // (SynValSig * MemberFlags) list
-    // SynField list
-    // bool
-    // bool
-    // SynSimplePat list option
     Range: range }
 
 and SynTypeDefnSimpleReprLibraryOnlyILAssemblyRcd = {
-    ILType: FSharp.Compiler.AbstractIL.IL.ILType
+    ILType: obj
     Range: range }
 
 and SynTypeDefnSimpleReprTypeAbbrevRcd = {
-    ParseDetail: FSharp.Compiler.SyntaxTree.ParserDetail
+    ParseDetail: Fantomas.FCS.Syntax.ParserDetail
     Type: SynType
     Range: range }
 
@@ -492,7 +503,7 @@ type SynTypeDefnSimpleRepr with
         | SynTypeDefnSimpleRepr.General(kind, _, _, _, _ , _, _, range) -> // TODO
             SynTypeDefnSimpleReprRcd.General { Kind = kind; Range = range }
         | SynTypeDefnSimpleRepr.LibraryOnlyILAssembly(iltype, range) ->
-            SynTypeDefnSimpleReprRcd.LibraryOnlyILAssembly { ILType = unbox iltype; Range = range }
+            SynTypeDefnSimpleReprRcd.LibraryOnlyILAssembly { ILType = iltype; Range = range }
         | SynTypeDefnSimpleRepr.TypeAbbrev(parseDetail, typ, range) ->
             SynTypeDefnSimpleReprRcd.TypeAbbrev { ParseDetail = parseDetail; Type = typ; Range = range }
         | SynTypeDefnSimpleRepr.None(range) ->
@@ -507,12 +518,16 @@ type SynEnumCaseRcd = {
     Range: range }
 with
     member x.FromRcd =
-        SynEnumCase.EnumCase(x.Attributes, x.Id, x.Constant, x.XmlDoc, x.Range)
+        SynEnumCase.SynEnumCase(x.Attributes, SynIdent(x.Id, None), SynExpr.Const(x.Constant, x.Range), x.XmlDoc, x.Range, { BarRange = None; EqualsRange = x.Range })
 
 type SynEnumCase with
     member x.ToRcd =
         match x with
-        | EnumCase(attributes, id, constant, xmlDoc, range) ->
+        | SynEnumCase(attributes, SynIdent(id, _), valueExpr, xmlDoc, range, _trivia) ->
+            let constant =
+                match valueExpr with
+                | SynExpr.Const(c, _) -> c
+                | _ -> SynConst.Unit
             { Attributes = attributes; Id = id; Constant = constant; XmlDoc = xmlDoc; Range = range }
 
 type XmlDoc with
@@ -522,22 +537,22 @@ type XmlDoc with
 type SynUnionCaseRcd = {
     Attributes: SynAttributes
     Id: Ident
-    Type: SynUnionCaseType
+    Type: SynUnionCaseKind
     XmlDoc: PreXmlDoc
     Access: SynAccess option
     Range: range }
 with
     member x.FromRcd =
-        SynUnionCase.UnionCase(x.Attributes, x.Id, x.Type, x.XmlDoc, x.Access, x.Range)
+        SynUnionCase.SynUnionCase(x.Attributes, SynIdent(x.Id, None), x.Type, x.XmlDoc, x.Access, x.Range, { BarRange = None })
     member x.HasFields =
         match x.Type with
-        | UnionCaseFields cases -> not cases.IsEmpty
+        | SynUnionCaseKind.Fields cases -> not cases.IsEmpty
         | _ -> false
 
 type SynUnionCase with
     member x.ToRcd : SynUnionCaseRcd =
         match x with
-        | SynUnionCase.UnionCase(attributes, id, typ, xmlDoc, access, range) ->
+        | SynUnionCase.SynUnionCase(attributes, SynIdent(id, _), typ, xmlDoc, access, range, _trivia) ->
             { Attributes = attributes; Id = id; Type = typ; XmlDoc = xmlDoc; Access = access; Range = range }
 
 type SynFieldRcd = {
@@ -551,12 +566,12 @@ type SynFieldRcd = {
     Range: range }
 with
     member x.FromRcd =
-        SynField.Field(x.Attributes, x.IsStatic, x.Id, x.Type, x.IsMutable, x.XmlDoc, x.Access, x.Range)
+        SynField.SynField(x.Attributes, x.IsStatic, x.Id, x.Type, x.IsMutable, x.XmlDoc, x.Access, x.Range, SynFieldTrivia.Zero)
 
 type SynField with
     member x.ToRcd: SynFieldRcd =
         match x with
-        | SynField.Field(attributes, isstatic, id, typ, ismutable, xmlDoc, access, range) ->
+        | SynField.SynField(attributes, isstatic, id, typ, ismutable, xmlDoc, access, range, _trivia) ->
              { Attributes = attributes
                IsStatic = isstatic
                Id = id
@@ -565,4 +580,3 @@ type SynField with
                XmlDoc = xmlDoc
                Access = access
                Range = range }
-

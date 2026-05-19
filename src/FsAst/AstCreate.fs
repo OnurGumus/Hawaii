@@ -1,32 +1,49 @@
 [<AutoOpen>]
 module FsAst.AstCreate
 open System
-open FSharp.Compiler.SyntaxTree
-open FSharp.Compiler.Text
-open FSharp.Compiler.XmlDoc
+open Fantomas.FCS.Syntax
+open Fantomas.FCS.SyntaxTrivia
+open Fantomas.FCS.Text
+open Fantomas.FCS.Xml
 
 let range0 = range.Zero
 
 type Ident with
-    static member Create text =
-        Ident(text, range.Zero)
+    static member Create (text: string) =
+        // Fantomas 7's mkIdent decides whether to surround an identifier with backticks
+        // purely by comparing the ident's range width to its text length: if the range
+        // is `text.Length + 4` wide it emits ``text``. Hawaii uses zero ranges everywhere,
+        // so for identifiers that need escaping (F# keywords, names with spaces, etc.) we
+        // synthesise a range of exactly that width to make Fantomas backtick them.
+        if not (String.IsNullOrEmpty text) && PrettyNaming.DoesIdentifierNeedBackticks text then
+            let escapedRange =
+                Range.mkRange "" (Position.mkPos 0 0) (Position.mkPos 0 (text.Length + 4))
+            Ident(text, escapedRange)
+        else
+            Ident(text, range.Zero)
     static member CreateLong (text: string) =
         text.Split([|'.'|]) |> List.ofArray |> List.map Ident.Create
 
-type LongIdentWithDots with
-    static member Create texts =
-        LongIdentWithDots(texts |> List.map Ident.Create, [])
-    static member CreateString (text: string) =
-        LongIdentWithDots(Ident.CreateLong text, [])
-    static member CreateFromLongIdent (longIdent: LongIdent) =
-        LongIdentWithDots(longIdent, [])
+[<AutoOpen>]
+module SynLongIdentHelpers =
+    let mkSynLongIdent (idents: LongIdent) : SynLongIdent =
+        SynLongIdent(idents, List.replicate (max 0 (idents.Length - 1)) range.Zero, List.replicate idents.Length None)
+
+type SynLongIdent with
+    static member Create (texts: string list) : SynLongIdent =
+        mkSynLongIdent (texts |> List.map Ident.Create)
+    static member CreateString (text: string) : SynLongIdent =
+        mkSynLongIdent (Ident.CreateLong text)
+    static member CreateFromLongIdent (longIdent: LongIdent) : SynLongIdent =
+        mkSynLongIdent longIdent
 
     member x.AsString =
+        let lid = x.LongIdent
         let sb = Text.StringBuilder()
-        for i in 0 .. x.Lid.Length - 2 do
-            sb.Append x.Lid.[i].idText |> ignore
+        for i in 0 .. lid.Length - 2 do
+            sb.Append lid.[i].idText |> ignore
             sb.Append '.' |> ignore
-        sb.Append x.Lid.[x.Lid.Length-1].idText |> ignore
+        sb.Append lid.[lid.Length-1].idText |> ignore
         sb.ToString()
 
 type SynPatLongIdentRcd with
@@ -57,15 +74,20 @@ type QualifiedNameOfFile with
     static member Create name =
         QualifiedNameOfFile(Ident.Create name)
 
-type MemberFlags with
-    static member InstanceMember =
-        { IsInstance = true; MemberKind = MemberKind.Member; IsDispatchSlot = false; IsOverrideOrExplicitImpl = false; IsFinal = false }
-    static member StaticMember =
-        { MemberFlags.InstanceMember with IsInstance = false }
+type SynMemberFlags with
+    static member InstanceMember : SynMemberFlags =
+        { IsInstance = true
+          IsDispatchSlot = false
+          IsOverrideOrExplicitImpl = false
+          IsFinal = false
+          GetterOrSetterIsCompilerGenerated = false
+          MemberKind = SynMemberKind.Member }
+    static member StaticMember : SynMemberFlags =
+        { SynMemberFlags.InstanceMember with IsInstance = false }
 
 type SynConst with
     static member CreateString s =
-        SynConst.String(s, range.Zero)
+        SynConst.String(s, SynStringKind.Regular, range.Zero)
 
 type SynExpr with
     static member CreateConst cnst =
@@ -87,11 +109,11 @@ type SynExpr with
     static member CreateLongIdent id =
         SynExpr.CreateLongIdent(false, id, None)
     static member CreateLongIdent (names: string list) =
-        SynExpr.CreateLongIdent(LongIdentWithDots.Create names)
+        SynExpr.CreateLongIdent(SynLongIdent.Create names)
     static member CreateParen expr =
-        SynExpr.Paren(expr, range.Zero, None, range.Zero)
+        SynExpr.Paren(expr, range.Zero, Some range.Zero, range.Zero)
     static member CreateTuple list =
-        SynExpr.Tuple(false, list, [], range.Zero)
+        SynExpr.Tuple(false, list, List.replicate (max 0 (List.length list - 1)) range.Zero, range.Zero)
     static member CreateParenedTuple list =
         SynExpr.CreateTuple list
         |> SynExpr.CreateParen
@@ -100,18 +122,18 @@ type SynExpr with
     static member CreateNull =
         SynExpr.Null(range.Zero)
     static member CreateIfThen(ifExpr, thenExpr) =
-        SynExpr.IfThenElse(ifExpr, thenExpr, None, DebugPointForBinding.DebugPointAtBinding(range0), false, range0, range0)
+        SynExpr.IfThenElse(ifExpr, thenExpr, None, DebugPointAtBinding.Yes range0, false, range0, { IfKeyword = range0; IsElif = false; ThenKeyword = range0; ElseKeyword = None; IfToThenRange = range0 })
     static member CreateIfThenElse(ifExpr, thenExpr, elseExpr) =
-        SynExpr.IfThenElse(ifExpr, thenExpr, Some elseExpr, DebugPointForBinding.DebugPointAtBinding(range0), false, range0, range0)
+        SynExpr.IfThenElse(ifExpr, thenExpr, Some elseExpr, DebugPointAtBinding.Yes range0, false, range0, { IfKeyword = range0; IsElif = false; ThenKeyword = range0; ElseKeyword = Some range0; IfToThenRange = range0 })
     static member CreateList(exprs: seq<SynExpr>) =
         SynExpr.ArrayOrList(false, Seq.toList exprs, range0)
     static member CreateRecord (fields: list<RecordFieldName * option<SynExpr>>) =
-        let fields = fields |> List.map (fun (rfn, synExpr) -> (rfn, synExpr, None))
+        let fields = fields |> List.map (fun (rfn, synExpr) -> SynExprRecordField(rfn, Some range.Zero, synExpr, None))
         SynExpr.Record(None, None, fields, range.Zero )
     static member CreateAsync(expr) =
-        SynExpr.App(ExprAtomicFlag.NonAtomic, false, SynExpr.CreateIdent(Ident.Create "async"), SynExpr.CompExpr(false, ref false, expr, range0), range0)
+        SynExpr.App(ExprAtomicFlag.NonAtomic, false, SynExpr.CreateIdent(Ident.Create "async"), SynExpr.ComputationExpr(false, expr, range0), range0)
     static member CreateTask(expr) =
-        SynExpr.App(ExprAtomicFlag.NonAtomic, false, SynExpr.CreateIdent(Ident.Create "task"), SynExpr.CompExpr(false, ref false, expr, range0), range0)
+        SynExpr.App(ExprAtomicFlag.NonAtomic, false, SynExpr.CreateIdent(Ident.Create "task"), SynExpr.ComputationExpr(false, expr, range0), range0)
     static member  CreateReturn(expr) =
         SynExpr.YieldOrReturn((false, true), expr, range0)
     static member CreatePartialApp(name: string, exprs: SynExpr list) =
@@ -128,8 +150,8 @@ type SynExpr with
         let functionArg = SynExpr.CreateLongIdent names
         exprs
         |> List.fold (fun expr argument -> SynExpr.CreateApp(expr, argument)) functionArg
-    static member CreateRecordUpdate (copyInfo: SynExpr, fieldUpdates ) =
-        let blockSep = (range.Zero, None) : BlockSeparator
+    static member CreateRecordUpdate (copyInfo: SynExpr, fieldUpdates: SynExprRecordField list ) =
+        let blockSep = (range.Zero, None)
         let copyInfo = Some (copyInfo, blockSep)
         SynExpr.Record (None, copyInfo, fieldUpdates, range.Zero)
     /// Creates:
@@ -142,22 +164,22 @@ type SynExpr with
     /// | clauseN
     /// ```
     static member CreateMatch(matchExpr, clauses) =
-        SynExpr.Match(DebugPointForBinding.DebugPointAtBinding range0, matchExpr, clauses, range0)
+        SynExpr.Match(DebugPointAtBinding.Yes range0, matchExpr, clauses, range0, { MatchKeyword = range0; WithKeyword = range0 })
     /// Creates : `instanceAndMethod(args)`
-    static member CreateInstanceMethodCall(instanceAndMethod : LongIdentWithDots, args) =
+    static member CreateInstanceMethodCall(instanceAndMethod : SynLongIdent, args) =
         let valueExpr = SynExpr.CreateLongIdent instanceAndMethod
         SynExpr.CreateApp(valueExpr, args)
     /// Creates : `instanceAndMethod()`
-    static member CreateInstanceMethodCall(instanceAndMethod : LongIdentWithDots) =
+    static member CreateInstanceMethodCall(instanceAndMethod : SynLongIdent) =
         SynExpr.CreateInstanceMethodCall(instanceAndMethod, SynExpr.CreateUnit)
     /// Creates : `instanceAndMethod<type1, type2,... type}>(args)`
-    static member CreateInstanceMethodCall(instanceAndMethod : LongIdentWithDots, instanceMethodsGenericTypes, args) =
+    static member CreateInstanceMethodCall(instanceAndMethod : SynLongIdent, instanceMethodsGenericTypes, args) =
         let valueExpr = SynExpr.CreateLongIdent instanceAndMethod
         let valueExprWithType = SynExpr.TypeApp(valueExpr, range0, instanceMethodsGenericTypes, [], None, range0, range0 )
         SynExpr.CreateApp(valueExprWithType, args)
     /// Creates: expr1; expr2; ... exprN
     static member CreateSequential exprs =
-        let seqExpr expr1 expr2 = SynExpr.Sequential(DebugPointAtSequential.Both, false, expr1, expr2, range0)
+        let seqExpr expr1 expr2 = SynExpr.Sequential(DebugPointAtSequential.SuppressNeither, false, expr1, expr2, range0, SynExprSequentialTrivia.Zero)
         let rec inner exprs state =
             match state, exprs with
             | None, [] -> SynExpr.CreateConst SynConst.Unit
@@ -178,15 +200,15 @@ type SynExpr with
 
 type SynType with
     static member CreateApp (typ, args, ?isPostfix) =
-        SynType.App(typ, None, args, [], None, (defaultArg isPostfix false), range.Zero)
+        SynType.App(typ, Some range.Zero, args, List.replicate (max 0 (List.length args - 1)) range.Zero, Some range.Zero, (defaultArg isPostfix false), range.Zero)
     static member CreateLongIdent id =
         SynType.LongIdent(id)
     static member CreateLongIdent s =
-        SynType.CreateLongIdent(LongIdentWithDots.CreateString s)
+        SynType.CreateLongIdent(SynLongIdent.CreateString s)
     static member CreateUnit =
         SynType.CreateLongIdent("unit")
     static member CreateFun (fieldTypeIn, fieldTypeOut) =
-        SynType.Fun (fieldTypeIn, fieldTypeOut, range.Zero)
+        SynType.Fun (fieldTypeIn, fieldTypeOut, range.Zero, { ArrowRange = range.Zero })
 
     static member Create(name: string) = SynType.CreateLongIdent name
 
@@ -197,8 +219,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member ResizeArray(inner: SynType) =
@@ -208,8 +230,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member Set(inner: SynType) =
@@ -219,8 +241,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member NativePointer(inner: SynType) =
@@ -230,8 +252,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member Option(inner: string) =
@@ -241,19 +263,19 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member Dictionary(key, value) =
         SynType.App(
-            typeName=SynType.LongIdent(LongIdentWithDots.Create [ "System"; "Collections"; "Generic"; "Dictionary" ]),
+            typeName=SynType.LongIdent(SynLongIdent.Create [ "System"; "Collections"; "Generic"; "Dictionary" ]),
             typeArgs=[ key; value ],
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member Map(key, value) =
@@ -263,8 +285,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member List(inner: SynType) =
@@ -274,8 +296,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member Array(inner: SynType) =
@@ -285,8 +307,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member List(inner: string) =
@@ -296,18 +318,18 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member DateTimeOffset() =
-        SynType.LongIdent(LongIdentWithDots.Create [ "System"; "DateTimeOffset" ])
+        SynType.LongIdent(SynLongIdent.Create [ "System"; "DateTimeOffset" ])
 
     static member DateTime() =
-        SynType.LongIdent(LongIdentWithDots.Create [ "System"; "DateTime" ])
+        SynType.LongIdent(SynLongIdent.Create [ "System"; "DateTime" ])
 
     static member Guid() =
-        SynType.LongIdent(LongIdentWithDots.Create [ "System"; "Guid" ])
+        SynType.LongIdent(SynLongIdent.Create [ "System"; "Guid" ])
 
     static member Int() =
         SynType.Create "int"
@@ -386,17 +408,17 @@ type SynBindingReturnInfoRcd with
 type SynBindingRcd with
     static member Null =
         {   Access = None
-            Kind = SynBindingKind.NormalBinding
+            Kind = SynBindingKind.Normal
             IsInline = false
             IsMutable = false
             Attributes = SynAttributes.Empty
             XmlDoc = PreXmlDoc.Empty
-            ValData = SynValData(Some MemberFlags.InstanceMember, SynValInfo.Empty, None)
+            ValData = SynValData(Some SynMemberFlags.InstanceMember, SynValInfo.Empty, None)
             Pattern = SynPatRcd.CreateNull
             ReturnInfo = None
             Expr = SynExpr.Null range.Zero
             Range = range.Zero
-            Bind = DebugPointForBinding.NoDebugPointAtInvisibleBinding
+            Bind = DebugPointAtBinding.NoneAtInvisible
         }
     static member Let =
         { SynBindingRcd.Null with
@@ -407,7 +429,7 @@ type SynBindingRcd with
 type SynComponentInfoRcd with
     static member Create id =
         {   Attributes = SynAttributes.Empty
-            Parameters = []
+            Parameters = None
             Constraints = []
             Id = id
             XmlDoc = PreXmlDoc.Empty
@@ -417,20 +439,32 @@ type SynComponentInfoRcd with
         }
 
 type SynMemberDefn with
-    static member CreateImplicitCtor (ctorArgs) =
-        SynMemberDefn.ImplicitCtor(None, SynAttributes.Empty, SynSimplePats.SimplePats(ctorArgs, range0), None, PreXmlDoc.Empty, range.Zero )
+    static member CreateImplicitCtor (ctorArgs: SynSimplePat list) =
+        let pats =
+            ctorArgs
+            |> List.map (fun sp ->
+                match sp with
+                | SynSimplePat.Id(ident, _, _, _, _, range) -> SynPat.Named(SynIdent(ident, None), false, None, range)
+                | SynSimplePat.Typed(SynSimplePat.Id(ident, _, _, _, _, idRange), typ, range) ->
+                    SynPat.Typed(SynPat.Named(SynIdent(ident, None), false, None, idRange), typ, range)
+                | _ -> SynPat.Wild range0)
+        let ctorPat =
+            match pats with
+            | [] -> SynPat.Paren(SynPat.Const(SynConst.Unit, range0), range0)
+            | [ single ] -> SynPat.Paren(single, range0)
+            | many -> SynPat.Paren(SynPat.Tuple(false, many, List.replicate (many.Length - 1) range0, range0), range0)
+        SynMemberDefn.ImplicitCtor(None, SynAttributes.Empty, ctorPat, None, PreXmlDoc.Empty, range.Zero, { AsKeyword = None } )
     static member CreateImplicitCtor() =
         SynMemberDefn.CreateImplicitCtor []
 
     static member CreateMember (binding:SynBindingRcd) =
         SynMemberDefn.Member(binding.FromRcd, range.Zero)
     static member CreateInterface(interfaceType, members) =
-        SynMemberDefn.Interface(interfaceType, members, range.Zero)
+        SynMemberDefn.Interface(interfaceType, None, members, range.Zero)
 
 type SynTypeDefnReprObjectModelRcd with
     static member Create members =
-        {   //Kind = SynTypeDefnKind.TyconClass
-            Kind = SynTypeDefnKind.TyconUnspecified
+        {   Kind = SynTypeDefnKind.Unspecified
             Members = members
             Range = range.Zero
         }
@@ -457,9 +491,10 @@ type SynModuleDecl with
     static member CreateOpen id =
         SynModuleDecl.Open(id, range.Zero)
     static member CreateOpen (fullNamespaceOrModuleName: string) =
-        SynModuleDecl.Open(SynOpenDeclTarget.ModuleOrNamespace(Ident.CreateLong fullNamespaceOrModuleName, range.Zero), range.Zero)
-    static member CreateHashDirective (directive, values) =
-        SynModuleDecl.HashDirective (ParsedHashDirective (directive, values, range.Zero), range.Zero)
+        SynModuleDecl.Open(SynOpenDeclTarget.ModuleOrNamespace(SynLongIdent.CreateString fullNamespaceOrModuleName, range.Zero), range.Zero)
+    static member CreateHashDirective (directive, values: string list) =
+        let args = values |> List.map (fun v -> ParsedHashDirectiveArgument.String(v, SynStringKind.Regular, range.Zero))
+        SynModuleDecl.HashDirective (ParsedHashDirective (directive, args, range.Zero), range.Zero)
     static member CreateLet (bindings: SynBindingRcd list) =
         SynModuleDecl.Let(false, bindings |> List.map(fun b -> b.FromRcd), range.Zero)
     static member CreateAttribute(ident, expr, isProp, ?target) =
@@ -471,7 +506,7 @@ type SynModuleDecl with
     static member CreateAttributes(attributes) =
         SynModuleDecl.Attributes(attributes, range.Zero)
     static member CreateNestedModule(info : SynComponentInfoRcd, members) =
-        SynModuleDecl.NestedModule(info.FromRcd, false, members, false, range.Zero)
+        SynModuleDecl.NestedModule(info.FromRcd, false, members, false, range.Zero, SynModuleDeclNestedModuleTrivia.Zero)
 
 type SynModuleOrNamespaceRcd with
     static member CreateModule id =
@@ -547,9 +582,9 @@ type SynUnionCaseRcd with
           Access = None
           Range = range.Zero }
 
-type SynUnionCaseType with
+type SynUnionCaseKind with
     static member Create(synFieldList : SynFieldRcd list) =
-        SynUnionCaseType.UnionCaseFields(synFieldList |> List.map (fun sf -> sf.FromRcd ))
+        SynUnionCaseKind.Fields(synFieldList |> List.map (fun sf -> sf.FromRcd ))
 
 type SynEnumCaseRcd with
     static member Create (id, cnst) =
@@ -577,42 +612,42 @@ type SynFieldRcd with
     static member CreateInt(id) =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateLongIdent "int")
     static member CreateIntOption(id) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ "int" ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ "int" ]) ]
     static member CreateString(id) =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateLongIdent "string")
     static member CreateStringOption(id) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ "string" ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ "string" ]) ]
     static member CreateFloat(id) =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateLongIdent "float")
     static member CreateFloatOption(id) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ "float" ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ "float" ]) ]
     static member CreateBool(id) =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateLongIdent "bool")
     static member CreateBoolOption(id) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ "bool" ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ "bool" ]) ]
     static member CreateDecimal(id) =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateLongIdent "decimal")
     static member CreateDecimalOption(id) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ "decimal" ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ "decimal" ]) ]
     static member CreateOption(id, optional) =
-        SynFieldRcd.CreateApp id (LongIdentWithDots.Create [ "Option" ]) [ (LongIdentWithDots.Create [ optional ]) ]
+        SynFieldRcd.CreateApp id (SynLongIdent.Create [ "Option" ]) [ (SynLongIdent.Create [ optional ]) ]
     static member CreateApp id typ args =
         SynFieldRcd.Create(Ident.Create id, SynType.CreateApp(SynType.CreateLongIdent typ, args |> List.map (SynType.CreateLongIdent)))
 
 type SynAttributeList with
-    static member Create(attrs) =
+    static member Create(attrs: SynAttribute list) : SynAttributeList =
         {
             Attributes = attrs
             Range = range0
         }
 
-    static member Create(attr) =
+    static member Create(attr: SynAttribute) : SynAttributeList =
         {
             Attributes = [ attr ]
             Range = range0
         }
 
-    static member Create([<ParamArray>] attrs) =
+    static member Create([<ParamArray>] attrs: SynAttribute[]) : SynAttributeList =
         {
             Attributes = List.ofArray attrs
             Range = range0
@@ -625,16 +660,16 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (SynConst.Unit, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ Ident.Create name ], [ ])
+           TypeName = mkSynLongIdent [ Ident.Create name ]
         }
 
     static member Create(name: string, argument: string) : SynAttribute =
         {
            AppliesToGetterAndSetter = false
-           ArgExpr = SynExpr.Const (SynConst.String(argument, range0), range0)
+           ArgExpr = SynExpr.Const (SynConst.String(argument, SynStringKind.Regular, range0), range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ Ident.Create name ], [ ])
+           TypeName = mkSynLongIdent [ Ident.Create name ]
         }
 
     static member Create(name: string, argument: bool) : SynAttribute =
@@ -643,7 +678,7 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (SynConst.Bool argument, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ Ident.Create name ], [ ])
+           TypeName = mkSynLongIdent [ Ident.Create name ]
         }
 
     static member Create(name: string, argument: int) : SynAttribute =
@@ -652,7 +687,7 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (SynConst.Int32 argument, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ Ident.Create name ], [ ])
+           TypeName = mkSynLongIdent [ Ident.Create name ]
         }
 
     static member Create(name: string, argument: SynConst) : SynAttribute =
@@ -661,7 +696,7 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (argument, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ Ident.Create name ], [ ])
+           TypeName = mkSynLongIdent [ Ident.Create name ]
         }
 
     static member Create(name: Ident, argument: SynConst) : SynAttribute =
@@ -670,7 +705,7 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (argument, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots([ name ], [ ])
+           TypeName = mkSynLongIdent [ name ]
         }
 
     static member Create(name: Ident list, argument: SynConst) : SynAttribute =
@@ -679,7 +714,7 @@ type SynAttribute with
            ArgExpr = SynExpr.Const (argument, range0)
            Range = range0
            Target = None
-           TypeName = LongIdentWithDots(name, [ ])
+           TypeName = mkSynLongIdent name
         }
 
     static member RequireQualifiedAccess() =

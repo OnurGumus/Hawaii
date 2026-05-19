@@ -1,7 +1,7 @@
 [<AutoOpen>]
 module Domain
 
-open FSharp.Compiler.SyntaxTree
+open Fantomas.FCS.Syntax
 open Newtonsoft.Json.Linq
 
 [<RequireQualifiedAccess>]

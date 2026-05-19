@@ -2,10 +2,10 @@
 module Extensions
 
 open FsAst
-open FSharp.Compiler.SyntaxTree
-open FSharp.Compiler.Text
-open FSharp.Compiler.XmlDoc
-open Fantomas
+open Fantomas.FCS.Syntax
+open Fantomas.FCS.Text
+open Fantomas.FCS.Xml
+open Fantomas.Core
 
 type SynFieldRcd with
     static member Create(name: string, fieldType: SynType) =
@@ -39,13 +39,14 @@ type SynMemberDefn with
     /// </summary>
     static member CreateStaticMember(binding:SynBindingRcd) =
         let (SynValData(usedMemberFlags, valInfo, identifier)) = binding.ValData
-        let staticMemberFlags = Some {
+        let staticMemberFlags : SynMemberFlags option = Some {
             // this means the member is static
-            IsInstance = false;
+            IsInstance = false
             IsOverrideOrExplicitImpl = false
-            IsDispatchSlot = false;
+            IsDispatchSlot = false
             IsFinal = false
-            MemberKind = MemberKind.Member
+            GetterOrSetterIsCompilerGenerated = false
+            MemberKind = SynMemberKind.Member
         }
         let staticBinding = { binding with ValData = SynValData.SynValData(staticMemberFlags, valInfo, identifier) }
         SynMemberDefn.Member(staticBinding.FromRcd, range.Zero)
@@ -57,7 +58,7 @@ type SynAttribute with
             ArgExpr = SynExpr.Const (SynConst.Unit, range0)
             Range = range0
             Target = None
-            TypeName = LongIdentWithDots(List.map Ident.Create idents, [ ])
+            TypeName = mkSynLongIdent (List.map Ident.Create idents)
         }
 
 type SynType with
@@ -68,8 +69,8 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member ODataResponse(valueType) =
@@ -79,14 +80,14 @@ type SynType with
             commaRanges = [ ],
             isPostfix = false,
             range=range0,
-            greaterRange=None,
-            lessRange=None
+            greaterRange=Some range0,
+            lessRange=Some range0
         )
 
     static member ByteArray() = SynType.Array(1, SynType.Byte(), range0)
-    static member JToken() = SynType.CreateLongIdent "Newtonsoft.Json.Linq.JToken"
-    static member JObject() = SynType.CreateLongIdent "Newtonsoft.Json.Linq.JObject"
-    static member JArray() = SynType.CreateLongIdent "Newtonsoft.Json.Linq.JArray"
+    static member JToken() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonNode"
+    static member JObject() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonObject"
+    static member JArray() = SynType.CreateLongIdent "System.Text.Json.Nodes.JsonArray"
     static member Object() = SynType.Create "obj"
 
 open System

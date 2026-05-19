@@ -20,7 +20,7 @@ let solutionRoot = Files.findParent __SOURCE_DIRECTORY__ "Hawaii.sln";
 
 let src = path [ solutionRoot; "src" ]
 
-let [<Literal>] TargetFramework = "net5.0"
+let [<Literal>] TargetFramework = "net10.0"
 
 let httpClient = new HttpClient()
 
@@ -133,7 +133,7 @@ let generateAndBuild(schema: ApiGuruSchema) =
     content.Add(JProperty("emptyDefinitions", schema.emptyDefinitions))
 
     File.WriteAllText(integrationSchema, content.ToString(Formatting.Indented))
-    let hawaii = path [ src; "bin"; "Release"; "net6.0"; "Hawaii.dll" ]
+    let hawaii = path [ src; "bin"; "Release"; "net10.0"; "Hawaii.dll" ]
     let configPath = path [ src; "hawaii.json" ]
     printfn $"Attempting to generate project {schema.title} from {schema.schemaUrl}"
     if Shell.Exec(Tools.dotnet, $"{hawaii} --config {configPath} --no-logo", src) <> 0 then

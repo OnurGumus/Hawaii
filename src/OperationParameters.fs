@@ -3,8 +3,8 @@ module OperationParameters
 
 open System
 open FsAst
-open FSharp.Compiler.SyntaxTree
-open Microsoft.OpenApi.Models
+open Fantomas.FCS.Syntax
+open Microsoft.OpenApi
 
 let private paramReplace (parameter: string) (sep: char) : string =
     let parts = parameter.Split(sep)
@@ -45,13 +45,13 @@ let rec private cleanParamIdent (parameter: string) (parameters: OperationParame
         else
             cleanedParam
 
-let rec private readParamType (target: Target) (schema: OpenApiSchema) : SynType =
-    if isNull schema then 
+let rec private readParamType (target: Target) (schema: IOpenApiSchema) : SynType =
+    if isNull (box schema) then
         if target = Target.FSharp
         then SynType.JToken()
         else SynType.Object()
     else
-    match schema.Type with
+    match schemaTypeName schema with
     | "integer" when schema.Format = "int64" -> SynType.Int64()
     | "integer" -> SynType.Int()
     | "number" when schema.Format = "float" -> SynType.Float32()
@@ -60,17 +60,20 @@ let rec private readParamType (target: Target) (schema: OpenApiSchema) : SynType
     | "string" when schema.Format = "uuid" -> SynType.Guid()
     | "string" when schema.Format = "guid" -> SynType.Guid()
     | "string" when schema.Format = "date-time" -> SynType.DateTimeOffset()
+    | "string" when schema.Format = "binary" ->
+        if target = Target.FSharp
+        then SynType.ByteArray()
+        else SynType.Create "File" // from Browser.Types
     | "string" -> SynType.String()
     | "file" ->
         if target = Target.FSharp
         then SynType.ByteArray()
         else SynType.Create "File" // from Browser.Types
-
-    | _ when not (isNull schema.Reference) ->
-        // working with a reference type
+    | _ when isSchemaReference schema ->
+        // working with a reference type (a $ref to a primitive resolves above)
         let typeName =
             if invalidTitle schema.Title
-            then sanitizeTypeName schema.Reference.Id
+            then sanitizeTypeName (schemaReferenceId schema)
             else sanitizeTypeName schema.Title
         SynType.Create typeName
     | "array" ->
@@ -82,27 +85,27 @@ let rec private readParamType (target: Target) (schema: OpenApiSchema) : SynType
     | _ ->
         SynType.String()
 
-let private isCancellationToken (parameter: OpenApiParameter) = 
-    isNotNull parameter.Schema && isNotNull parameter.Schema.Reference && parameter.Schema.Reference.Id = "CancellationToken"
+let private isCancellationToken (parameter: IOpenApiParameter) =
+    isNotNull (box parameter.Schema) && schemaReferenceId parameter.Schema = "CancellationToken"
 
 let private processOperationParameters
     (target: Target)
     (parameters: OperationParameter seq)
-    (parameter: OpenApiParameter)
+    (parameter: IOpenApiParameter)
     : OperationParameter option =
 
-    if isNull parameter ||
+    if isNull (box parameter) ||
        parameter.Deprecated ||
        not parameter.In.HasValue ||
-       isNull parameter.Schema
+       isNull (box parameter.Schema)
     then None
     else
         let shouldSpreadProperties =
             parameter.Style.HasValue
             && parameter.Style.Value = ParameterStyle.DeepObject
             && parameter.Explode
-            && isNotNull parameter.Schema
-            && parameter.Schema.Type = "object"
+            && isNotNull (box parameter.Schema)
+            && schemaTypeName parameter.Schema = "object"
 
         let properties =
             if shouldSpreadProperties
@@ -110,10 +113,10 @@ let private processOperationParameters
             else []
 
         let paramType =
-            if parameter.Content.Count = 1 then
+            if isNotNull parameter.Content && parameter.Content.Count = 1 then
                 let firstKey = Seq.head parameter.Content.Keys
                 readParamType target parameter.Content.[firstKey].Schema
-            elif parameter.In.Value = ParameterLocation.Header && isNotNull parameter.Schema && parameter.Schema.Type = "object" then
+            elif parameter.In.Value = ParameterLocation.Header && isNotNull (box parameter.Schema) && schemaTypeName parameter.Schema = "object" then
                 // edge case for a weird schema
                 SynType.String()
             else
@@ -121,9 +124,9 @@ let private processOperationParameters
 
         let nullable =
             if isNotNull parameter.Extensions && parameter.Extensions.ContainsKey "x-nullable" then
-                match parameter.Extensions.["x-nullable"] with
-                | :? Microsoft.OpenApi.Any.OpenApiBoolean as isNullable -> isNullable.Value
-                | _ -> true
+                match extensionBool parameter.Extensions.["x-nullable"] with
+                | Some isNullable -> isNullable
+                | None -> true
             else
                 true
 
@@ -144,8 +147,10 @@ let private processOperationParameters
             location = (string parameter.In.Value).ToLower()
             properties = properties
             style =
-                if parameter.Style.HasValue then (string parameter.Style).ToLower()
-                elif isCancellationToken parameter then "cancellation-token"
+                // a synthetic cancellation-token parameter must be detected before
+                // the parameter style, which the 3.x model now defaults for query parameters
+                if isCancellationToken parameter then "cancellation-token"
+                elif parameter.Style.HasValue then (string parameter.Style).ToLower()
                 else "none"
         }
 
@@ -155,7 +160,7 @@ let private processOperationRequestBody
     (parameters: OperationParameter seq)
     : OperationParameter list =
 
-    if isNull operation.RequestBody then []
+    if isNull (box operation.RequestBody) then []
     else
         let content = operation.RequestBody.Content
 
@@ -164,18 +169,18 @@ let private processOperationRequestBody
             let typeName = "body"
             let parameterName =
                 if operation.RequestBody.Extensions.ContainsKey "x-bodyName" then
-                    match operation.RequestBody.Extensions.["x-bodyName"] with
-                    | :? Microsoft.OpenApi.Any.OpenApiString as name -> name.Value
-                    | _ -> camelCase (normalizeFullCaps typeName)
+                    match extensionString operation.RequestBody.Extensions.["x-bodyName"] with
+                    | Some name -> name
+                    | None -> camelCase (normalizeFullCaps typeName)
                 else
                     camelCase (normalizeFullCaps typeName)
 
             let requestTypePayload =
                 if operation.Extensions.ContainsKey "RequestTypePayload" then
-                    match operation.Extensions.["RequestTypePayload"] with
-                    | :? Microsoft.OpenApi.Any.OpenApiString as requestTypePayload ->
-                        SynType.Create requestTypePayload.Value
-                    | _ ->
+                    match extensionString operation.Extensions.["RequestTypePayload"] with
+                    | Some requestTypePayload ->
+                        SynType.Create requestTypePayload
+                    | None ->
                         readParamType config.target schema
                 else
                     readParamType config.target schema
@@ -196,9 +201,9 @@ let private processOperationRequestBody
             let typeName = "body"
             let parameterName =
                 if operation.RequestBody.Extensions.ContainsKey "x-bodyName" then
-                    match operation.RequestBody.Extensions.["x-bodyName"] with
-                    | :? Microsoft.OpenApi.Any.OpenApiString as name -> name.Value
-                    | _ -> camelCase (normalizeFullCaps typeName)
+                    match extensionString operation.RequestBody.Extensions.["x-bodyName"] with
+                    | Some name -> name
+                    | None -> camelCase (normalizeFullCaps typeName)
                 else
                     camelCase (normalizeFullCaps typeName)
 
@@ -211,7 +216,7 @@ let private processOperationRequestBody
                     then SynType.JToken()
                     else SynType.Object()
                 docs =
-                    if isNotNull schema
+                    if isNotNull (box schema)
                     then schema.Description
                     else ""
                 location = "jsonContent"
@@ -219,7 +224,7 @@ let private processOperationRequestBody
                 properties = []
             }]
 
-        elif content.ContainsKey "multipart/form-data" && isNotNull content.["multipart/form-data"].Schema && content.["multipart/form-data"].Schema.Type = "object" then
+        elif content.ContainsKey "multipart/form-data" && isNotNull (box content.["multipart/form-data"].Schema) && schemaTypeName content.["multipart/form-data"].Schema = "object" then
             content.["multipart/form-data"].Schema.Properties
             |> Seq.map (fun property ->
                 let parameterIdentifier = cleanParamIdent property.Key parameters
@@ -242,12 +247,12 @@ let private processOperationRequestBody
                 })
             |> Seq.toList
 
-        elif content.ContainsKey "multipart/form-data" && isNotNull content.["multipart/form-data"].Schema && content.["multipart/form-data"].Schema.Type = "file" then
+        elif content.ContainsKey "multipart/form-data" && isNotNull (box content.["multipart/form-data"].Schema) && schemaTypeName content.["multipart/form-data"].Schema = "file" then
             let parameterName =
                 if operation.RequestBody.Extensions.ContainsKey "x-bodyName" then
-                    match operation.RequestBody.Extensions.["x-bodyName"] with
-                    | :? Microsoft.OpenApi.Any.OpenApiString as name -> name.Value
-                    | _ -> "body"
+                    match extensionString operation.RequestBody.Extensions.["x-bodyName"] with
+                    | Some name -> name
+                    | None -> "body"
                 else
                     "body"
 
@@ -267,7 +272,7 @@ let private processOperationRequestBody
 
         elif content.ContainsKey "application/x-www-form-urlencoded" then
             let schema = content.["application/x-www-form-urlencoded"].Schema
-            if isNull schema || schema.Type = "object" then []
+            if isNull (box schema) || schemaTypeName schema = "object" then []
             else
                 schema.Properties
                 |> Seq.map (fun property ->
@@ -298,7 +303,7 @@ let private processOperationRequestBody
 
 let operationParameters
     (operation: OpenApiOperation)
-    (pathInfoParameters: OpenApiParameter seq)
+    (pathInfoParameters: IOpenApiParameter seq)
     (config: CodegenConfig)
     : OperationParameter list =
 
@@ -309,7 +314,7 @@ let operationParameters
             | None -> opParameters
             | Some opParameter -> opParameter :: opParameters) []
         |> List.rev
-    
+
     let rqParameters =
         processOperationRequestBody config operation opParameters
         |> List.rev

@@ -1,11 +1,12 @@
 module CodeGen
 
 open FsAst
-open FSharp.Compiler.XmlDoc
-open FSharp.Compiler.SyntaxTree
-open Fantomas
-open FSharp.Compiler.Text
-open Fantomas.FormatConfig
+open Fantomas.FCS.Xml
+open Fantomas.FCS.Syntax
+open Fantomas.FCS.SyntaxTrivia
+open Fantomas.Core
+open Fantomas.FCS.Text
+open Fantomas.Core
 
 let createNamespace (names: seq<string>) declarations =
     let nameParts =
@@ -17,7 +18,7 @@ let createNamespace (names: seq<string>) declarations =
         )
 
     let xmlDoc = PreXmlDoc.Create [ ]
-    SynModuleOrNamespace.SynModuleOrNamespace([ for name in nameParts -> Ident.Create name ], true, SynModuleOrNamespaceKind.DeclaredNamespace,declarations,  xmlDoc, [ ], None, range.Zero)
+    SynModuleOrNamespace.SynModuleOrNamespace([ for name in nameParts -> Ident.Create name ], true, SynModuleOrNamespaceKind.DeclaredNamespace,declarations,  xmlDoc, [ ], None, range.Zero, { LeadingKeyword = SynModuleOrNamespaceLeadingKeyword.Namespace range.Zero })
 
 let createQualifiedModule (idens: seq<string>) declarations =
     let nameParts =
@@ -29,27 +30,21 @@ let createQualifiedModule (idens: seq<string>) declarations =
         )
 
     let xmlDoc = PreXmlDoc.Create [ ]
-    SynModuleOrNamespace.SynModuleOrNamespace([ for ident in nameParts -> Ident.Create ident ], true, SynModuleOrNamespaceKind.NamedModule,declarations,  xmlDoc, [ SynAttributeList.Create [ SynAttribute.RequireQualifiedAccess()  ]  ], None, range.Zero)
+    SynModuleOrNamespace.SynModuleOrNamespace([ for ident in nameParts -> Ident.Create ident ], true, SynModuleOrNamespaceKind.NamedModule,declarations,  xmlDoc, [ SynAttributeList.Create [ SynAttribute.RequireQualifiedAccess()  ]  ], None, range.Zero, { LeadingKeyword = SynModuleOrNamespaceLeadingKeyword.Module range.Zero })
 
 let createFile modules =
     let qualfiedNameOfFile = QualifiedNameOfFile.QualifiedNameOfFile(Ident.Create "IrrelevantFileName")
-    ParsedImplFileInput.ParsedImplFileInput("IrrelevantFileName", false, qualfiedNameOfFile, [], [], modules, (false, false))
+    ParsedImplFileInput.ParsedImplFileInput("IrrelevantFileName", false, qualfiedNameOfFile, [], [], modules, (false, false), { ConditionalDirectives = []; CodeComments = [] }, Set.empty)
 
 let formatAstInternal ast =
     let cfg = {
         FormatConfig.Default
             with
-                StrictMode = true
-                DisableElmishSyntax = false
                 IndentSize = 4
                 MaxIfThenElseShortWidth = 4
     }
 
-    CodeFormatter.FormatASTAsync(ast, "temp.fsx", [], None, cfg)
-
-let stringEnumAttr = """namespace Fable.Core
-type StringEnumAttribute() =
-    inherit System.Attribute()"""
+    CodeFormatter.FormatASTAsync(ast, cfg)
 
 let formatAst file =
     formatAstInternal (ParsedInput.ImplFile file)
